@@ -32,13 +32,63 @@ def default_torch_dtype(dtype: torch.dtype):
     torch.set_default_dtype(current_dtype)
 
 
-@torch.no_grad()
 def padding(tensor, left=True):
-    zeropadding = torch.zeros_like(tensor[:, -1:])
-    if left:
-        tensor = torch.cat((zeropadding, tensor[:, :-1]), dim=1)
-    else:
-        tensor = torch.cat((tensor[:, 1:], zeropadding), dim=1)
+    # Two implementations:
+    #   * out-of-place (the original): allocates a new tensor via torch.cat,
+    #     so peak memory is 2x the input. Required for tensors that may be
+    #     tracked by autograd (loss_mask, position_mask, input_ids etc.) -
+    #     mutating them in place would break a saved-for-backward version.
+    #   * in-place chunked: overwrites the input via a small scratch buffer.
+    #     Used for the verifier's huge [seq, full_vocab] logits tensor at
+    #     long context (~16 GiB at L=65536, vocab=131072), where the cat
+    #     variant pushed us past the 96 GB GPU ceiling.
+    # Heuristic: only go in-place when (a) the tensor is large enough that
+    # out-of-place would be a real memory hazard, AND (b) it's a floating
+    # point tensor (the integer masks are tiny anyway and can be on the
+    # autograd graph). The threshold is high enough that none of the masks
+    # / input_ids ever take the in-place path.
+    is_big_float = (
+        tensor.dim() >= 2
+        and tensor.is_floating_point()
+        and tensor.element_size() * tensor.numel() >= 1024 * 1024 * 1024  # 1 GiB
+    )
+    if not is_big_float:
+        # Slice along dim=1 (seq), preserving any trailing dims (e.g.
+        # position_mask is [batch, seq, 1]).
+        zeropadding = torch.zeros_like(tensor[:, -1:])
+        if left:
+            return torch.cat((zeropadding, tensor[:, :-1]), dim=1)
+        return torch.cat((tensor[:, 1:], zeropadding), dim=1)
+
+    # In-place chunked shift along dim=1.
+    with torch.no_grad():
+        N = tensor.shape[1]
+        if N <= 1:
+            tensor.zero_()
+            return tensor
+
+        bytes_per_col = max(1, tensor[:, :1].element_size() * tensor[:, :1].numel())
+        SCRATCH_BYTES = 2 * 1024 * 1024 * 1024
+        chunk_cols = max(1, min(N, SCRATCH_BYTES // bytes_per_col))
+
+        if left:
+            # Shift right by 1: out[k] = tensor[k-1] for k>=1, out[0] = 0.
+            end = N
+            while end > 1:
+                start = max(end - chunk_cols, 1)
+                chunk = tensor[:, start - 1 : end - 1].clone()
+                tensor[:, start:end].copy_(chunk)
+                end = start
+            tensor[:, 0].zero_()
+        else:
+            # Shift left by 1: out[k] = tensor[k+1] for k<N-1, out[N-1] = 0.
+            start = 0
+            while start < N - 1:
+                end = min(start + chunk_cols, N - 1)
+                chunk = tensor[:, start + 1 : end + 1].clone()
+                tensor[:, start:end].copy_(chunk)
+                start = end
+            tensor[:, -1].zero_()
     return tensor
 
 
@@ -375,6 +425,28 @@ def safe_conversations_generator(file_path):
                             new_msg[k] = v
 
                     cleaned_convs.append(new_msg)
+
+                # 3b. Normalize the message struct schema across the whole
+                # conversation. PyArrow infers a strict struct type from the
+                # first batch of rows; if a later row contains a message with
+                # extra fields (e.g. tool_calls / tool_call_id / name on
+                # SFT tool-use turns) the cast will fail. Ensure every message
+                # carries the same set of keys, defaulting absent ones to "".
+                _ALL_MSG_KEYS = (
+                    "role",
+                    "content",
+                    "name",
+                    "tool_call_id",
+                    "tool_calls",
+                )
+                for msg in cleaned_convs:
+                    for k in _ALL_MSG_KEYS:
+                        if k not in msg:
+                            # Empty string keeps the pyarrow inferred dtype as
+                            # `string` for every message column. None would let
+                            # the first batch lock the column to `null`, then
+                            # later batches with real strings fail to cast.
+                            msg[k] = ""
 
                 # Build result with conversations
                 result = {"conversations": cleaned_convs}

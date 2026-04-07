@@ -50,6 +50,14 @@ class Parser(ABC):
         if "tool_calls" in cleaned:
             tool_calls = cleaned["tool_calls"]
 
+            # safe_conversations_generator inserts an empty-string placeholder
+            # for the tool_calls field on non-tool messages so that pyarrow
+            # locks every message column to the same `string` dtype. Treat
+            # that as "no tool calls" silently.
+            if tool_calls == "" or tool_calls is None:
+                cleaned.pop("tool_calls", None)
+                return cleaned
+
             # tool_calls is a string → Parsing
             if isinstance(tool_calls, str):
                 try:
@@ -222,16 +230,75 @@ class GeneralParser(Parser):
         if not self.tokenizer.pad_token_id:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
 
-        # get input_ids
-        encoding = self.tokenizer(
-            conversation,
-            max_length=max_length,
-            truncation=True,
-            return_tensors="pt",
-            add_special_tokens=False,
-        )
+        # Single tokenize call with offset mapping. For fast tokenizers this
+        # is dramatically cheaper than re-encoding conversation prefixes for
+        # every assistant turn (the previous implementation was O(num_turns
+        # * seq_len), which dominates wall-clock for long reasoning traces
+        # at max_length=4096+).
+        try:
+            encoding = self.tokenizer(
+                conversation,
+                max_length=max_length,
+                truncation=True,
+                return_tensors="pt",
+                return_offsets_mapping=True,
+                add_special_tokens=False,
+            )
+            offsets = encoding["offset_mapping"][0].tolist()
+            fast_path = True
+        except (TypeError, NotImplementedError, ValueError):
+            # Slow tokenizer fallback: no offset mapping available.
+            encoding = self.tokenizer(
+                conversation,
+                max_length=max_length,
+                truncation=True,
+                return_tensors="pt",
+                add_special_tokens=False,
+            )
+            offsets = None
+            fast_path = False
+
         input_ids = encoding.input_ids[0]
         loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
+
+        # ---- helper: map (char_start, char_end) -> token (start, end) ----
+        # Token i covers chars [offsets[i][0], offsets[i][1]). The first token
+        # whose end > char_start is our start; the first token whose start
+        # >= char_end is our end. Binary search both via bisect.
+        import bisect
+
+        if fast_path:
+            token_starts = [o[0] for o in offsets]
+            token_ends = [o[1] for o in offsets]
+
+            def char_span_to_token_span(c_start: int, c_end: int):
+                # start: first token whose end > c_start
+                start = bisect.bisect_right(token_ends, c_start)
+                # end: first token whose start >= c_end
+                end = bisect.bisect_left(token_starts, c_end)
+                start = min(start, len(input_ids))
+                end = min(end, len(input_ids))
+                return start, end
+        else:
+            # Slow-path fallback: re-tokenize prefixes (the original
+            # implementation). Only used for non-fast tokenizers.
+            def char_span_to_token_span(c_start: int, c_end: int):
+                prefix_ids = self.tokenizer.encode(
+                    conversation[:c_start],
+                    add_special_tokens=False,
+                    truncation=True,
+                    max_length=max_length,
+                )
+                full_ids = self.tokenizer.encode(
+                    conversation[:c_end],
+                    add_special_tokens=False,
+                    truncation=True,
+                    max_length=max_length,
+                )
+                return (
+                    min(len(prefix_ids), len(input_ids)),
+                    min(len(full_ids), len(input_ids)),
+                )
 
         matches = list(re.finditer(self.assistant_pattern, conversation, re.DOTALL))
         if train_only_last_turn and matches:
@@ -240,30 +307,9 @@ class GeneralParser(Parser):
         for match in matches:
             content_start_char = match.start(1)
             content_end_char = match.end(1)
-
-            # --- Core Alternative Operation: Calculate Token Index Based on Prefix String Length ---
-            # Encode the text "assistant start", the length of which is the position of the starting token.
-            prefix_ids = self.tokenizer.encode(
-                conversation[:content_start_char],
-                add_special_tokens=False,
-                truncation=True,
-                max_length=max_length,
+            actual_start, actual_end = char_span_to_token_span(
+                content_start_char, content_end_char
             )
-            # Encodes the text "assistant end", the length of which is the position of the end token.
-            full_ids = self.tokenizer.encode(
-                conversation[:content_end_char],
-                add_special_tokens=False,
-                truncation=True,
-                max_length=max_length,
-            )
-
-            start_token_idx = len(prefix_ids)
-            end_token_idx = len(full_ids)
-
-            # Handling out-of-bounds errors caused by truncation
-            actual_start = min(start_token_idx, len(input_ids))
-            actual_end = min(end_token_idx, len(input_ids))
-
             if actual_start < actual_end:
                 loss_mask[actual_start:actual_end] = 1
 
@@ -278,26 +324,9 @@ class GeneralParser(Parser):
                         break
                     ignore_start_char = idx
                     ignore_end_char = idx + len(token_str)
-
-                    prefix_ids = self.tokenizer.encode(
-                        conversation[:ignore_start_char],
-                        add_special_tokens=False,
-                        truncation=True,
-                        max_length=max_length,
-                    )
-                    full_ids = self.tokenizer.encode(
-                        conversation[:ignore_end_char],
-                        add_special_tokens=False,
-                        truncation=True,
-                        max_length=max_length,
-                    )
-
-                    start_token_idx = min(len(prefix_ids), len(input_ids))
-                    end_token_idx = min(len(full_ids), len(input_ids))
-
-                    if start_token_idx < end_token_idx:
-                        loss_mask[start_token_idx:end_token_idx] = 0
-
+                    s, e = char_span_to_token_span(ignore_start_char, ignore_end_char)
+                    if s < e:
+                        loss_mask[s:e] = 0
                     start = ignore_end_char
 
         return input_ids, loss_mask
