@@ -1462,6 +1462,26 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         return self.fc(hidden_states)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Optional gradient checkpointing on the lm_head logits computation.
+        # The lm_head output shape is [bsz, seq, draft_vocab], which at long
+        # context (e.g. seq=65536, draft_vocab=32000) is ~4 GiB per TTT
+        # unroll. Across ttt_length=7 unrolls these dominate memory after
+        # the MLP intermediates are checkpointed. Recomputing the
+        # norm + lm_head linear during backward saves ~28 GiB at the cost
+        # of ~10% extra compute. Toggled by the same `_grad_checkpoint`
+        # flag set on the MLP module by --draft-mlp-grad-checkpoint, since
+        # the two checkpoints are useless without each other.
+        do_ckpt = (
+            self.training
+            and getattr(self.midlayer.mlp, "_grad_checkpoint", False)
+            and torch.is_grad_enabled()
+        )
+        if do_ckpt:
+            def _forward(h):
+                return self.lm_head(self.norm(h))
+            return torch.utils.checkpoint.checkpoint(
+                _forward, hidden_states, use_reentrant=False
+            )
         norm_hidden_states = self.norm(hidden_states)
         return self.lm_head(norm_hidden_states)
 
