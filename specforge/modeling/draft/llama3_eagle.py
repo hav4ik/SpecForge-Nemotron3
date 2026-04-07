@@ -10,7 +10,11 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
-from yunchang.comm import SeqAllToAll4D
+try:
+    from yunchang.comm import SeqAllToAll4D  # noqa: F401
+except ImportError:  # pragma: no cover
+    # yunchang is only required for the USP (sequence-parallel) attention backend.
+    SeqAllToAll4D = None
 
 from specforge.modeling.draft.flex_attention import (
     compile_friendly_create_block_mask,
@@ -39,14 +43,26 @@ def _make_causal_mask(
     dtype: torch.dtype,
     device: torch.device,
     past_key_values_length: int = 0,
+    sliding_window: int = 0,
 ):
     """
     Make causal mask used for bi-directional self-attention.
+
+    If `sliding_window > 0`, restrict each query at position i to attend only
+    to keys at positions in [i - sliding_window + 1, i] (a band-causal mask).
     """
     bsz, tgt_len = input_ids_shape
     mask = torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device)
     mask_cond = torch.arange(mask.size(-1), device=device)
     mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+
+    if sliding_window and sliding_window > 0:
+        # Zero out (i.e. mask in attention) positions where i - j >= sliding_window
+        i_idx = torch.arange(tgt_len, device=device).view(-1, 1)
+        j_idx = torch.arange(tgt_len, device=device).view(1, -1)
+        outside_window = (i_idx - j_idx) >= sliding_window
+        mask.masked_fill_(outside_window, torch.finfo(dtype).min)
+
     mask = mask.to(dtype)
 
     if past_key_values_length > 0:
@@ -160,7 +176,11 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim
 
 
 def prepare_decoder_attention_mask(
-    attention_mask, input_shape, inputs_embeds, past_key_values_length
+    attention_mask,
+    input_shape,
+    inputs_embeds,
+    past_key_values_length,
+    sliding_window: int = 0,
 ):
     # create causal mask
     # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
@@ -171,6 +191,7 @@ def prepare_decoder_attention_mask(
             inputs_embeds.dtype,
             device=inputs_embeds.device,
             past_key_values_length=past_key_values_length,
+            sliding_window=sliding_window,
         )
 
     if attention_mask is not None:
@@ -834,12 +855,16 @@ class LlamaFlexAttention(LlamaAttention):
             create_block_mask_func = compile_friendly_create_block_mask
             flex_attention_func = compile_friendly_flex_attention
 
+        # Read sliding window from config (0 = full causal). Set
+        # `sliding_window` on the draft model's config.json to enable.
+        sliding_window = getattr(self.config, "sliding_window", None) or 0
         block_mask = create_block_mask_func(
             mask_mod=generate_eagle3_mask(
                 seq_lengths=seq_lengths,
                 Q_LEN=q_len,
                 KV_LEN=key_cache.shape[-2],
                 lck=lck,
+                sliding_window=sliding_window,
             ),
             B=bsz,
             H=1,  # Rely on broadcast
@@ -1303,7 +1328,25 @@ class LlamaDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        # Optional gradient checkpointing on the MLP only. The MLP is purely
+        # functional (no cache state), so re-running it during backward is
+        # safe, and it holds the bulk of per-step activations: gate_proj /
+        # act_fn(gate) / up_proj / (gate*up) at intermediate_size each.
+        # Enabling this trades ~33% extra compute for ~75% less per-step
+        # activation memory, which lets us run TTT=7 at long context.
+        # Toggled by setting `mlp_grad_checkpoint=True` on the draft config.
+        if (
+            self.training
+            and getattr(self.mlp, "_grad_checkpoint", False)
+            and torch.is_grad_enabled()
+        ):
+            hidden_states = torch.utils.checkpoint.checkpoint(
+                self.mlp,
+                hidden_states,
+                use_reentrant=False,
+            )
+        else:
+            hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
         # outputs = (hidden_states, return_hidden)
@@ -1380,8 +1423,16 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             attention_mask = torch.ones(
                 (batch_size, seq_length), dtype=torch.bool, device=hidden_states.device
             )
+        # Read sliding_window from the draft model config (0 = full causal).
+        # Only threaded into the SDPA/fa/usp dense-mask path; the flex_attention
+        # backend reads it directly inside LlamaFlexAttention.forward.
+        _draft_sw = getattr(self.config, "sliding_window", None) or 0
         attention_mask = prepare_decoder_attention_mask(
-            attention_mask, (batch_size, seq_length), hidden_states, 0
+            attention_mask,
+            (batch_size, seq_length),
+            hidden_states,
+            0,
+            sliding_window=_draft_sw,
         )
 
         # fc

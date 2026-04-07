@@ -106,14 +106,28 @@ def compile_friendly_create_block_mask(
 
 
 def generate_eagle3_mask(
-    seq_lengths: torch.Tensor, Q_LEN: int, KV_LEN: int, lck: int = 0
+    seq_lengths: torch.Tensor,
+    Q_LEN: int,
+    KV_LEN: int,
+    lck: int = 0,
+    sliding_window: int = 0,
 ):
+    # If sliding_window > 0, the first-step (Q_LEN x Q_LEN) causal block is
+    # restricted so that each query attends only to keys within the last
+    # `sliding_window` positions (q_idx - kv_idx <= sliding_window - 1).
+    # The TTT suffix_mask (single per-position K/V additions per unroll step)
+    # is intentionally NOT windowed -- those are tiny and carry the
+    # multi-step prediction signal we explicitly want.
+    use_window = sliding_window > 0
 
     def causal_mask(b, h, q_idx, kv_idx):
         # Causal will keep shrinking by 1 diagnol due to appended suffix
         # Shirnk the causal by diagnol
         causal_mask = q_idx >= kv_idx
         padding_mask = (kv_idx < seq_lengths[b]) & (q_idx < seq_lengths[b])
+        if use_window:
+            window_mask = (q_idx - kv_idx) < sliding_window
+            return causal_mask & padding_mask & window_mask
         return causal_mask & padding_mask
 
     def suffix_mask(b, h, q_idx, kv_idx):
@@ -123,5 +137,7 @@ def generate_eagle3_mask(
         return suffix_mask & padding_mask & diagnol_mask
 
     mask_mod = or_masks(causal_mask, suffix_mask)
-    mask_mod.__name__ = f"eagle3_mask_Q_{Q_LEN}_KV_{KV_LEN}_lck_{lck}"
+    mask_mod.__name__ = (
+        f"eagle3_mask_Q_{Q_LEN}_KV_{KV_LEN}_lck_{lck}_sw_{sliding_window}"
+    )
     return mask_mod
