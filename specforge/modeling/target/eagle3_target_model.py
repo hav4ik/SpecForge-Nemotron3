@@ -1,42 +1,58 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-import sglang.srt.managers.mm_utils as mm_utils
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
-    init_mm_embedding_cache,
-)
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-    Req,
-    ScheduleBatch,
-)
-
-# - prepare_mlp_sync_batch_raw is now a module-level function, not a Scheduler method
-from sglang.srt.managers.scheduler_dp_attn_mixin import prepare_mlp_sync_batch_raw
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
-from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 from transformers import AutoModelForCausalLM
+
+# sglang is an optional dependency: only required for the sglang target backend.
+# Import lazily so the HF and custom backends can be used in environments where
+# sglang is not installed (e.g. when training against an HF-only model).
+try:
+    import sglang.srt.managers.mm_utils as mm_utils  # noqa: F401
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+    from sglang.srt.managers.mm_utils import (
+        MultiModalityDataPaddingPatternMultimodalTokens,
+        init_mm_embedding_cache,
+    )
+    from sglang.srt.managers.schedule_batch import (
+        Modality,
+        MultimodalDataItem,
+        MultimodalInputs,
+        Req,
+        ScheduleBatch,
+    )
+
+    # - prepare_mlp_sync_batch_raw is now a module-level function, not a Scheduler method
+    from sglang.srt.managers.scheduler_dp_attn_mixin import prepare_mlp_sync_batch_raw
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.radix_cache import RadixCache
+    from sglang.srt.model_executor.forward_batch_info import (
+        CaptureHiddenMode,
+        ForwardBatch,
+    )
+    from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+    from sglang.srt.sampling.sampling_params import SamplingParams
+    from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
+
+    from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
+    from .sglang_backend.utils import LogitsProcessorForEAGLE3
+
+    _SGLANG_AVAILABLE = True
+    _SGLANG_IMPORT_ERROR = None
+except ImportError as _e:  # pragma: no cover - exercised only without sglang
+    _SGLANG_AVAILABLE = False
+    _SGLANG_IMPORT_ERROR = _e
 
 from specforge.distributed import get_tp_device_mesh, get_tp_group
 from specforge.utils import padding
-
-from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
-from .sglang_backend.utils import LogitsProcessorForEAGLE3
 
 
 @dataclass
@@ -156,6 +172,12 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         """
         if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
             return self.model.model.layers
+        elif hasattr(self.model, "backbone") and hasattr(
+            self.model.backbone, "layers"
+        ):
+            # NemotronH (and other "backbone"-style hybrid models) place layers under
+            # `backbone.layers` rather than `model.layers`.
+            return self.model.backbone.layers
         elif hasattr(self.model, "layers"):
             return self.model.layers
         elif hasattr(self.model, "transformer") and hasattr(
@@ -846,6 +868,12 @@ def get_eagle3_target_model(
     **kwargs,
 ) -> Eagle3TargetModel:
     if backend == "sglang":
+        if not _SGLANG_AVAILABLE:
+            raise ImportError(
+                "The 'sglang' target backend was requested but sglang is not installed. "
+                "Either install sglang (`pip install sglang==0.5.9`) or pass "
+                "`--target-model-backend hf` (or `custom`) on the training script."
+            ) from _SGLANG_IMPORT_ERROR
         return SGLangEagle3TargetModel.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
