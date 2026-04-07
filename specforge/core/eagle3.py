@@ -28,7 +28,11 @@ import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
 
 from specforge.core.eagle3_adapters import BackendAdapter, SdpaLikeAdapter, UspAdapter
-from specforge.core.loss import LogSoftmaxLoss
+from specforge.core.loss import (
+    LogSoftmaxLoss,
+    fused_linear_argmax_correct_count,
+    fused_linear_log_softmax_loss,
+)
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
 
@@ -55,18 +59,32 @@ class OnlineEagle3Model(Eagle3Model):
         length: int = 7,
         attention_backend="sdpa",
         target_model: Optional[Eagle3Model] = None,
+        fused_linear_loss: bool = False,
+        fused_linear_loss_chunk_size: int = 4096,
     ):
         """
         Args:
             target_model: the target model to extract hidden states.
             draft_model: the draft model to be trained.
             length: TTT length, it means how many turns to unroll during TTT.
+            fused_linear_loss: if True, replace the
+                ``compute_logits -> LogSoftmaxLoss.apply`` pipeline with
+                a chunked, grad-checkpointed fused linear + soft-target
+                cross-entropy that never materializes the full
+                ``[B, T, V]`` logits tensor. Required for ttt_length>=5
+                at long context (e.g. L=65536) on a 96 GB GPU. Output
+                value and gradient are bit-equivalent (up to fp reduction
+                order) to the unchunked path.
+            fused_linear_loss_chunk_size: number of sequence positions
+                per chunk in the fused path. Default 4096.
         """
         super().__init__()
         self.draft_model = draft_model
         self.length = length
         self.attention_backend = attention_backend
         self.target_model = target_model
+        self.fused_linear_loss = fused_linear_loss
+        self.fused_linear_loss_chunk_size = fused_linear_loss_chunk_size
 
     def _make_adapter(self) -> BackendAdapter:
         if self.attention_backend == "usp":
@@ -93,6 +111,57 @@ class OnlineEagle3Model(Eagle3Model):
             acc = local_correct / local_denom
 
         loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+        loss = adapter.reduce_loss(loss)
+        return acc, loss
+
+    def _acc_and_loss_fused(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        target_p: torch.Tensor,
+        position_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        adapter: BackendAdapter,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Fused chunked equivalent of _acc_and_loss. Takes the post-backbone
+        ``hidden_states`` (NOT the materialized logits) and runs the
+        norm + lm_head + soft-target cross-entropy in chunks along the
+        sequence dimension, with grad checkpointing per chunk so the
+        full [B, T, V] logits tensor is never alive.
+
+        Numerically equivalent (up to fp reduction order) to the
+        unchunked path -- see specforge/core/loss.py __main__.
+        """
+        # The draft's compute_logits is `lm_head(self.norm(h))`. We do
+        # the norm here in fp32 grad-tracked land, and pass the result
+        # to the chunked fused-linear-loss helper which handles the
+        # lm_head linear + log-softmax + CE.
+        norm_hidden = self.draft_model.norm(hidden_states)
+
+        with torch.no_grad():
+            local_correct = fused_linear_argmax_correct_count(
+                norm_hidden,
+                self.draft_model.lm_head.weight,
+                target_p,
+                position_mask,
+                lm_head_bias=getattr(self.draft_model.lm_head, "bias", None),
+                chunk_size=self.fused_linear_loss_chunk_size,
+            )
+            local_denom = loss_mask.sum().clamp_min(1e-6)
+            local_correct, local_denom = adapter.reduce_metrics(
+                local_correct=local_correct, local_denom=local_denom
+            )
+            acc = local_correct / local_denom
+
+        loss = fused_linear_log_softmax_loss(
+            norm_hidden,
+            self.draft_model.lm_head.weight,
+            target_p,
+            position_mask,
+            lm_head_bias=getattr(self.draft_model.lm_head, "bias", None),
+            chunk_size=self.fused_linear_loss_chunk_size,
+        )
         loss = adapter.reduce_loss(loss)
         return acc, loss
 
@@ -256,17 +325,32 @@ class OnlineEagle3Model(Eagle3Model):
             # update hidden states for next step
             hidden_states = hidden_states_out
 
-            # Step 5.4: get logits
-            logits = self.draft_model.compute_logits(hidden_states)
-
-            # Step 5.5 + 5.6: metric and loss
-            acc, loss = self._acc_and_loss(
-                logits=logits,
-                target_p=state.target_p,
-                position_mask=state.position_mask,
-                loss_mask=state.loss_mask,
-                adapter=adapter,
-            )
+            # Step 5.4 + 5.5 + 5.6: get logits + metric + loss.
+            # When `fused_linear_loss` is enabled (long-context training),
+            # we never materialize the full [B, T, V] logits tensor: the
+            # chunked path uses the existing LogSoftmaxLoss kernel
+            # per-sequence-chunk inside torch.utils.checkpoint, and the
+            # accuracy metric is computed via a separate no_grad chunked
+            # argmax counter. Mathematically equivalent to the unchunked
+            # path (verified numerically in specforge/core/loss.py
+            # __main__).
+            if self.fused_linear_loss:
+                acc, loss = self._acc_and_loss_fused(
+                    hidden_states=hidden_states,
+                    target_p=state.target_p,
+                    position_mask=state.position_mask,
+                    loss_mask=state.loss_mask,
+                    adapter=adapter,
+                )
+            else:
+                logits = self.draft_model.compute_logits(hidden_states)
+                acc, loss = self._acc_and_loss(
+                    logits=logits,
+                    target_p=state.target_p,
+                    position_mask=state.position_mask,
+                    loss_mask=state.loss_mask,
+                    adapter=adapter,
+                )
             acces.append(acc)
             plosses.append(loss)
 

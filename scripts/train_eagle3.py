@@ -177,6 +177,30 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
             "ttt_length>=5 at long context (e.g. L=65536) on a 96 GB GPU."
         ),
     )
+    training_group.add_argument(
+        "--fused-linear-loss",
+        action="store_true",
+        help=(
+            "Enable the chunked, grad-checkpointed fused linear + "
+            "soft-target cross-entropy path. Replaces the unchunked "
+            "compute_logits -> LogSoftmaxLoss pipeline so the full "
+            "[B, T, V] draft logits tensor is never materialized. "
+            "Mathematically equivalent to the unchunked path "
+            "(verified in specforge/core/loss.py __main__). Saves "
+            "~28 GiB at L=65k, ttt_length=7, V=32k. Recommended "
+            "alongside --draft-mlp-grad-checkpoint for long-context training."
+        ),
+    )
+    training_group.add_argument(
+        "--fused-linear-loss-chunk-size",
+        type=int,
+        default=4096,
+        help=(
+            "Sequence positions per chunk in the --fused-linear-loss "
+            "path. Smaller = lower per-chunk peak memory but more "
+            "kernel launches. Default 4096."
+        ),
+    )
 
     # data processing type
     optimization_group = parser.add_argument_group("optimization")
@@ -848,6 +872,8 @@ def main():
                 draft_model=draft_model,
                 length=args.ttt_length,
                 attention_backend=args.attention_backend,
+                fused_linear_loss=args.fused_linear_loss,
+                fused_linear_loss_chunk_size=args.fused_linear_loss_chunk_size,
             )
         else:
             # offline: the target_model is TargetHead not a model
@@ -855,6 +881,8 @@ def main():
                 draft_model=draft_model,
                 length=args.ttt_length,
                 attention_backend=args.attention_backend,
+                fused_linear_loss=args.fused_linear_loss,
+                fused_linear_loss_chunk_size=args.fused_linear_loss_chunk_size,
             )
     eagle3_model = FSDP(
         eagle3_model,

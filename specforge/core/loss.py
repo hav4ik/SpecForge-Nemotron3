@@ -228,8 +228,158 @@ class LogSoftmaxLoss(torch.autograd.Function):
         return logits, None, None, None, None
 
 
+def fused_linear_log_softmax_loss(
+    hidden_states: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    target_p: torch.Tensor,
+    position_mask: torch.Tensor,
+    *,
+    lm_head_bias: torch.Tensor | None = None,
+    chunk_size: int = 4096,
+) -> torch.Tensor:
+    """
+    Memory-efficient fused (linear + soft-target log-softmax cross-entropy)
+    loss for the Eagle3 draft head.
+
+    Computes the same value (up to floating-point error) as
+
+        logits = F.linear(hidden_states, lm_head_weight, lm_head_bias)
+        loss   = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+
+    but never materializes the full ``[B, T, V]`` logits tensor in
+    memory. Instead, the sequence dimension is split into chunks of
+    ``chunk_size`` positions; each chunk's `(linear, log_softmax,
+    soft-target CE)` is computed inside ``torch.utils.checkpoint`` so
+    that during the forward pass only one chunk's logits exist (~250 MB
+    at chunk_size=4096, V=32k, bf16) and during the backward pass each
+    chunk's logits are recomputed sequentially.
+
+    The mathematics are exact: the loss is a sum over independent
+    positions
+
+        L = (1/N) * sum_t mask_t * (-sum_v target_p[t,v] * log p_draft(t,v))
+
+    where ``N = B*T``, so chunking the outer sum is bit-equivalent to
+    the unchunked computation up to floating-point reduction order.
+    See the ``__main__`` block at the bottom of this file for a
+    numerical equivalence test.
+
+    At long context (L=65k, V=32k, ttt_length=7) this saves
+    ``7 * (B*T*V*2 - chunk_size*V*2) = ~28 GiB`` of activation memory
+    relative to the unchunked path -- the difference between fitting
+    on a 96 GB GPU and OOMing.
+
+    Args:
+        hidden_states: ``[B, T, H]`` draft model output (after the
+            final RMSNorm). Requires_grad=True for training.
+        lm_head_weight: ``[V, H]`` draft model lm_head weight.
+        target_p: ``[B, T, V]`` verifier soft-target distribution
+            (already softmaxed and ``t2d``-remapped to draft vocab).
+        position_mask: ``[B, T, 1]`` integer/bool mask of which
+            positions contribute to the loss.
+        lm_head_bias: optional ``[V]`` lm_head bias. SpecForge's
+            LlamaForCausalLMEagle3 lm_head has bias=False, so this
+            usually stays None.
+        chunk_size: positions per chunk. 4096 is a good default --
+            smaller chunks reduce per-chunk peak memory at the cost of
+            more kernel launches.
+
+    Returns:
+        Scalar loss tensor (gradient-tracked w.r.t. hidden_states and
+        lm_head_weight).
+    """
+    B, T, H = hidden_states.shape
+    V = lm_head_weight.shape[0]
+    if T == 0:
+        return hidden_states.new_zeros((), requires_grad=True)
+    chunk_size = max(1, min(chunk_size, T))
+
+    def _chunk_loss(h_chunk, target_chunk, mask_chunk, weight, bias):
+        # h_chunk:      [B, chunk, H]
+        # target_chunk: [B, chunk, V]
+        # mask_chunk:   [B, chunk, 1]
+        logits_chunk = torch.nn.functional.linear(h_chunk, weight, bias)
+        # LogSoftmaxLoss returns mean over (B*chunk). Multiply back by
+        # (B*chunk) so the per-chunk values are sums; the outer loop
+        # then divides by (B*T) to recover the same mean the unchunked
+        # path computes.
+        chunk_mean = LogSoftmaxLoss.apply(logits_chunk, target_chunk, mask_chunk)
+        return chunk_mean * (h_chunk.shape[0] * h_chunk.shape[1])
+
+    total_loss_sum = hidden_states.new_zeros(())
+    for start in range(0, T, chunk_size):
+        end = min(start + chunk_size, T)
+        h_chunk = hidden_states[:, start:end, :].contiguous()
+        target_chunk = target_p[:, start:end, :].contiguous()
+        mask_chunk = position_mask[:, start:end, :].contiguous()
+
+        # Wrap each chunk in checkpoint so the per-chunk logits tensor
+        # is never persisted between forward and backward.
+        chunk_loss_sum = torch.utils.checkpoint.checkpoint(
+            _chunk_loss,
+            h_chunk,
+            target_chunk,
+            mask_chunk,
+            lm_head_weight,
+            lm_head_bias,
+            use_reentrant=False,
+        )
+        total_loss_sum = total_loss_sum + chunk_loss_sum
+
+    return total_loss_sum / (B * T)
+
+
+@torch.no_grad()
+def fused_linear_argmax_correct_count(
+    hidden_states: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    target_p: torch.Tensor,
+    position_mask: torch.Tensor,
+    *,
+    lm_head_bias: torch.Tensor | None = None,
+    chunk_size: int = 4096,
+) -> torch.Tensor:
+    """
+    Counterpart to ``fused_linear_log_softmax_loss``: computes the
+    chunked argmax-equality "accuracy correct count" without
+    materializing the full ``[B, T, V]`` logits tensor.
+
+    Returns the unreduced number of positions where
+    ``argmax(linear(h)) == argmax(target_p)`` AND the position mask
+    is set, as a 0-dim float tensor. The caller is responsible for
+    dividing by the denominator (``loss_mask.sum()``) to get the
+    accuracy.
+
+    Runs in ``no_grad`` -- this is purely a metric.
+    """
+    B, T, H = hidden_states.shape
+    if T == 0:
+        return hidden_states.new_zeros(())
+    chunk_size = max(1, min(chunk_size, T))
+
+    target_argmax = target_p.argmax(-1)  # [B, T]  -- typically tiny
+    position_mask_2d = position_mask.squeeze(-1)  # [B, T]
+
+    correct = hidden_states.new_zeros((), dtype=torch.float32)
+    for start in range(0, T, chunk_size):
+        end = min(start + chunk_size, T)
+        h_chunk = hidden_states[:, start:end, :]
+        logits_chunk = torch.nn.functional.linear(h_chunk, lm_head_weight, lm_head_bias)
+        argmax_chunk = logits_chunk.argmax(-1)
+        del logits_chunk
+        chunk_correct = (
+            (argmax_chunk == target_argmax[:, start:end])
+            * position_mask_2d[:, start:end]
+        ).float().sum()
+        correct = correct + chunk_correct
+
+    return correct
+
+
 if __name__ == "__main__":
     device = "cuda"
+
+    # ----- Existing test: triton kernel == reference torch.compile path
     B, T, V = 1, 1024, 16000
     logits = torch.randn(B, T, V, device=device, requires_grad=True)
     logits2 = logits.clone().detach().requires_grad_(True)
@@ -242,3 +392,59 @@ if __name__ == "__main__":
     output1.backward()
     output2.backward()
     torch.testing.assert_close(logits.grad, logits2.grad, rtol=1e-4, atol=1e-4)
+    print("[loss-test] LogSoftmaxLoss vs torch reference: OK")
+
+    # ----- New test: chunked fused linear loss == unchunked path
+    # Realistic-ish shapes for the Eagle3 draft head.
+    torch.manual_seed(0)
+    B, T, H, V = 1, 2048, 2688, 32000
+    chunk_size = 512  # use a small chunk so multiple chunks exercise the loop
+
+    hidden = torch.randn(B, T, H, device=device, dtype=torch.float32) * 0.1
+    weight = torch.randn(V, H, device=device, dtype=torch.float32) * 0.05
+    target_logits = torch.randn(B, T, V, device=device, dtype=torch.float32) * 0.1
+    target_p = torch.softmax(target_logits, dim=-1)
+    pos_mask = torch.randint(0, 2, (B, T, 1), dtype=torch.long, device=device)
+
+    # ---- Reference: unchunked compute
+    hidden_ref = hidden.clone().detach().requires_grad_(True)
+    weight_ref = weight.clone().detach().requires_grad_(True)
+    logits_ref = torch.nn.functional.linear(hidden_ref, weight_ref)
+    loss_ref = LogSoftmaxLoss.apply(logits_ref, target_p, pos_mask)
+    loss_ref.backward()
+
+    # ---- Chunked path
+    hidden_ck = hidden.clone().detach().requires_grad_(True)
+    weight_ck = weight.clone().detach().requires_grad_(True)
+    loss_ck = fused_linear_log_softmax_loss(
+        hidden_ck,
+        weight_ck,
+        target_p,
+        pos_mask,
+        chunk_size=chunk_size,
+    )
+    loss_ck.backward()
+
+    print(
+        f"[loss-test] chunked vs unchunked loss: ref={loss_ref.item():.6e} "
+        f"chunked={loss_ck.item():.6e}"
+    )
+    torch.testing.assert_close(loss_ref, loss_ck, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(hidden_ref.grad, hidden_ck.grad, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(weight_ref.grad, weight_ck.grad, rtol=1e-4, atol=1e-5)
+    print("[loss-test] fused_linear_log_softmax_loss equivalence: OK")
+
+    # ---- Sanity test for the argmax counter
+    correct_chunked = fused_linear_argmax_correct_count(
+        hidden, weight, target_p, pos_mask, chunk_size=chunk_size
+    )
+    with torch.no_grad():
+        logits_full = torch.nn.functional.linear(hidden, weight)
+        correct_ref = (
+            (logits_full.argmax(-1) == target_p.argmax(-1)) * pos_mask.squeeze(-1)
+        ).float().sum()
+    torch.testing.assert_close(correct_chunked, correct_ref, rtol=0, atol=0)
+    print(
+        f"[loss-test] fused_linear_argmax_correct_count equivalence: "
+        f"OK ({int(correct_ref.item())} correct)"
+    )
