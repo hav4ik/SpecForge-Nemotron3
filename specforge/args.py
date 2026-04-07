@@ -2,7 +2,11 @@ import argparse
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
-from sglang.srt.server_args import ATTENTION_BACKEND_CHOICES
+try:
+    from sglang.srt.server_args import ATTENTION_BACKEND_CHOICES
+except ImportError:  # pragma: no cover
+    # sglang is only required if --target-model-backend sglang is used.
+    ATTENTION_BACKEND_CHOICES = None
 
 
 @dataclass

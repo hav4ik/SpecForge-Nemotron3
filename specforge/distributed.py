@@ -3,7 +3,12 @@ from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
-from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
+try:
+    from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
+except ImportError:  # pragma: no cover
+    # yunchang is only required for the USP (sequence-parallel) attention backend.
+    PROCESS_GROUP = None
+    set_seq_parallel_pg = None
 
 from specforge.utils import print_with_rank
 
