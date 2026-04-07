@@ -1199,6 +1199,29 @@ class LlamaMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
+        # Sequence-chunk size for the chunked-MLP forward path. Set to 0 (or
+        # leave None) to disable chunking and use the standard fused
+        # `down_proj(act_fn(gate_proj(x)) * up_proj(x))` call. When set to
+        # a positive integer, the MLP processes the sequence dimension in
+        # chunks of that size, never materializing the full
+        # ``[B, T, intermediate]`` tensors -- the per-step transient peak
+        # drops from ``4 * B * T * intermediate * dtype_bytes`` to about
+        # ``4 * B * chunk * intermediate * dtype_bytes`` plus the
+        # preallocated ``[B, T, hidden]`` output buffer. Combined with
+        # `_grad_checkpoint=True`, each chunk is wrapped in
+        # `torch.utils.checkpoint.checkpoint(use_reentrant=False)` so the
+        # per-step saved-for-backward footprint also scales with chunk
+        # size rather than with the full sequence length.
+        self._chunk_size = 0
+
+    def _chunk_forward(self, x_chunk: torch.Tensor) -> torch.Tensor:
+        # Single-chunk MLP forward, used as the inner function for both
+        # the chunked path and the chunked + grad-checkpoint path. Kept
+        # as a method (rather than a closure) so torch.utils.checkpoint
+        # can serialize / replay it without capturing self.
+        gate = self.gate_proj(x_chunk)
+        up = self.up_proj(x_chunk)
+        return self.down_proj(self.act_fn(gate) * up)
 
     def forward(self, x):
         if self.config.pretraining_tp > 1:
@@ -1228,10 +1251,49 @@ class LlamaMLP(nn.Module):
                 for i in range(self.config.pretraining_tp)
             ]
             down_proj = sum(down_proj)
-        else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+            return down_proj
 
-        return down_proj
+        # Optional sequence-chunked path. Active when both _chunk_size > 0
+        # AND we're in training mode AND grad is enabled (so we never pay
+        # the chunking overhead at inference, where seq_len=1 anyway and
+        # the chunked path collapses to a single full call).
+        chunk_size = getattr(self, "_chunk_size", 0)
+        do_chunk = (
+            chunk_size
+            and chunk_size > 0
+            and x.dim() == 3
+            and x.shape[1] > chunk_size
+            and self.training
+            and torch.is_grad_enabled()
+        )
+        if not do_chunk:
+            return self._chunk_forward(x)
+
+        B, T, H = x.shape
+        # Process each chunk independently and concatenate. We use
+        # torch.cat over a list rather than indexed assignment into a
+        # preallocated buffer because the latter creates an in-place
+        # SetItem op in the autograd graph that confuses the outer
+        # LlamaDecoderLayer grad-checkpoint wrapper. The intermediate
+        # list of [B, chunk, H] tensors carries ~B*T*H*dtype_bytes
+        # total memory (same as the output buffer would have), and the
+        # final cat is allocated only once.
+        #
+        # Important: we deliberately do NOT wrap each chunk in
+        # torch.utils.checkpoint here. The outer LlamaDecoderLayer
+        # already wraps the entire self.mlp(x) call in checkpoint when
+        # `_grad_checkpoint=True`, so adding an inner per-chunk
+        # checkpoint would result in nested checkpoints with double
+        # forward recomputation during backward (~2x compute waste).
+        # The outer checkpoint provides save-for-backward memory
+        # reduction; chunking here provides per-step transient-peak
+        # reduction. They compose cleanly without inner ckpt.
+        chunks_out = []
+        for start in range(0, T, chunk_size):
+            end = min(start + chunk_size, T)
+            x_chunk = x[:, start:end, :]
+            chunks_out.append(self._chunk_forward(x_chunk))
+        return torch.cat(chunks_out, dim=1)
 
 
 class LlamaRMSNorm(nn.Module):

@@ -192,6 +192,21 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         ),
     )
     training_group.add_argument(
+        "--draft-mlp-chunk-size",
+        type=int,
+        default=0,
+        help=(
+            "Sequence chunk size for the draft MLP forward. When > 0, "
+            "the MLP processes the seq dim in chunks of this many "
+            "positions, never materializing the full "
+            "[B, T, intermediate] tensors. Reduces the per-step "
+            "transient peak memory during the MLP forward (e.g. from "
+            "~4 GiB to ~250 MiB at L=65k, intermediate=8064, chunk=4096). "
+            "Combine with --draft-mlp-grad-checkpoint for the saved-"
+            "for-backward reduction. Default 0 (chunking disabled)."
+        ),
+    )
+    training_group.add_argument(
         "--fused-linear-loss-chunk-size",
         type=int,
         default=4096,
@@ -823,6 +838,18 @@ def main():
             print_on_rank0(
                 "[grad-checkpoint] WARN: --draft-mlp-grad-checkpoint requested "
                 "but draft_model has no .midlayer.mlp; ignoring"
+            )
+    if args.draft_mlp_chunk_size > 0:
+        # Tag the draft MLP module to enable sequence-chunked forward.
+        # Reduces the per-step transient peak from
+        # ~4 * B * T * intermediate * 2 bytes to
+        # ~4 * B * chunk * intermediate * 2 bytes. Pairs naturally with
+        # --draft-mlp-grad-checkpoint (no nested checkpointing).
+        if hasattr(draft_model, "midlayer") and hasattr(draft_model.midlayer, "mlp"):
+            draft_model.midlayer.mlp._chunk_size = args.draft_mlp_chunk_size
+            print_on_rank0(
+                f"[mlp-chunk] Enabled chunked MLP forward with chunk_size="
+                f"{args.draft_mlp_chunk_size}"
             )
     target_model, processor = build_target_model(args, draft_model_config, is_online)
 
