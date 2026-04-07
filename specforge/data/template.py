@@ -314,6 +314,20 @@ TEMPLATE_REGISTRY.register(
 
 
 TEMPLATE_REGISTRY.register(
+    name="nemotron-h",
+    template=ChatTemplate(
+        # Nemotron-Cascade-2-30B-A3B uses ChatML markers identical to Qwen.
+        # The tokenizer's built-in chat_template is what actually renders the
+        # conversation; we only need assistant_header / end_of_turn_token to
+        # match the rendered text so the loss-mask substring search works.
+        assistant_header="<|im_start|>assistant\n",
+        user_header="<|im_start|>user\n",
+        system_prompt="You are a helpful and harmless assistant.\n\nYou are not allowed to use any tools.",
+        end_of_turn_token="<|im_end|>\n",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
     name="qwen3.5",
     template=ChatTemplate(
         assistant_header="<|im_start|>assistant\n<think>\n",
