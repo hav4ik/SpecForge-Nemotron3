@@ -639,6 +639,10 @@ def run_forward(
             loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
             target = get_dp_data_shard_from_tp(eagle3_data.target)
             hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
+            # Drop the dataclass so the only remaining references to the
+            # tensors above are the locals -- otherwise the ~16 GiB full-vocab
+            # `target` tensor stays alive across the entire draft forward.
+            del eagle3_data
         else:
             # we generate the logits using the hidden states loaded from disk
             attention_mask = data["attention_mask"].cuda()
@@ -651,11 +655,30 @@ def run_forward(
                 target.cuda()
             )  # The `data['target']` value occupies a large amount of GPU memory, with a shape of [seqlen, vocab_size]. It needs to be processed before being loaded into the GPU.
             loss_mask = loss_mask.cuda()
+        # Pre-compute target_p_padded BEFORE entering eagle3_model.forward()
+        # so we can free the huge full-vocab `target` logits tensor
+        # (~8.6 GiB at L=32k vocab=131k) before the draft TTT unrolling
+        # holds activations for ttt_length steps. Otherwise the outer
+        # `target` ref keeps the tensor alive throughout the entire
+        # backward pass and OOMs the 96 GB GPU.
+        from specforge.core.eagle3 import _compute_target_p_padded as _compute_tpp
+        # Resolve the inner OnlineEagle3Model through any wrapping (FSDP).
+        _inner = eagle3_model.module if hasattr(eagle3_model, "module") else eagle3_model
+        target_p_padded, position_mask = _compute_tpp(
+            target=target,
+            t2d=_inner.draft_model.t2d,
+            loss_mask=loss_mask,
+            length=_inner.length,
+        )
+        del target
+        torch.cuda.empty_cache()
         plosses, _, acces = eagle3_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
-            target=target,
+            target=None,
+            target_p_padded=target_p_padded,
+            position_mask=position_mask,
             hidden_states=hidden_states,
             position_ids=(
                 data["position_ids"].cuda() if "position_ids" in data else None

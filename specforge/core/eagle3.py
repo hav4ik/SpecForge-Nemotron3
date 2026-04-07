@@ -133,13 +133,15 @@ class OnlineEagle3Model(Eagle3Model):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        target: torch.Tensor,
-        loss_mask: torch.Tensor,
-        hidden_states: torch.Tensor,
+        target: torch.Tensor = None,
+        loss_mask: torch.Tensor = None,
+        hidden_states: torch.Tensor = None,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         is_vlm: bool = False,
+        target_p_padded: Optional[torch.Tensor] = None,
+        position_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
         """
@@ -151,16 +153,21 @@ class OnlineEagle3Model(Eagle3Model):
             loss_mask: (batch, seq_len)
             past_key_values: We dont use this past_key_values in eagle3, but keep it for compatibility. We control kvcache by cache_hidden.
             position_ids: (batch, seq_len)
+            target_p_padded, position_mask: optional precomputed values. If
+                provided, `target` is unused and the (huge full-vocab logits)
+                tensor never enters this scope at all -- the caller can free
+                it before invoking forward, which is critical at long context.
         """
         # Step 1: handle vocab size
-        target_p_padded, position_mask = _compute_target_p_padded(
-            target=target,
-            t2d=self.draft_model.t2d,
-            loss_mask=loss_mask,
-            length=self.length,
-        )
-        del target
-        torch.cuda.empty_cache()
+        if target_p_padded is None or position_mask is None:
+            target_p_padded, position_mask = _compute_target_p_padded(
+                target=target,
+                t2d=self.draft_model.t2d,
+                loss_mask=loss_mask,
+                length=self.length,
+            )
+            del target
+            torch.cuda.empty_cache()
 
         # basic info
         batch_size, seq_length, _ = hidden_states.shape
@@ -593,8 +600,12 @@ def _compute_target_p(target, t2d, loss_mask):
     target_mask = target_mask[..., None].int()
     position_mask = target_mask * loss_mask
     target_head = target_head[..., t2d]
-    target_head = target_head.float()
-    target_p = nn.Softmax(dim=2)(target_head)
+    # NOTE: keep target_p in bf16 (the source dtype) to halve the activation
+    # footprint at long context. The downstream LogSoftmaxLoss triton kernel
+    # casts target_block to fp32 internally before use, so the upstream .float()
+    # upcast was wasted. At L=65536, draft_vocab=32k this saves ~4 GiB on
+    # target_p plus another ~4 GiB on its padded copy.
+    target_p = nn.Softmax(dim=2)(target_head.float()).to(target_head.dtype)
     target_p = target_p.detach()
     return target_p, position_mask
 
