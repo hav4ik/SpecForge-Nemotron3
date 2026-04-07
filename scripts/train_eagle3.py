@@ -165,6 +165,18 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     )
     training_group.add_argument("--seed", type=int, default=0)
     training_group.add_argument("--draft-accumulation-steps", type=int, default=1)
+    training_group.add_argument(
+        "--draft-mlp-grad-checkpoint",
+        action="store_true",
+        help=(
+            "Enable gradient checkpointing on the draft model's MLP. "
+            "Recomputes gate_proj/silu/up_proj/(gate*up) intermediates "
+            "during backward instead of saving them across the TTT "
+            "unrolling, trading ~33%% extra compute for ~75%% lower "
+            "per-step MLP activation footprint. Required to fit "
+            "ttt_length>=5 at long context (e.g. L=65536) on a 96 GB GPU."
+        ),
+    )
 
     # data processing type
     optimization_group = parser.add_argument_group("optimization")
@@ -772,6 +784,22 @@ def main():
     # 2. Build models
     # ================================================
     draft_model_config, draft_model, ckpt_info, resume_state = build_draft_model(args)
+    if args.draft_mlp_grad_checkpoint:
+        # Tag the draft layer's MLP module so LlamaDecoderLayer.forward wraps
+        # it in torch.utils.checkpoint.checkpoint at training time. See
+        # specforge/modeling/draft/llama3_eagle.py:LlamaDecoderLayer.forward
+        # for the toggle's read site. Required to fit ttt_length>=5 at
+        # long context (e.g. L=65536) on a single 96 GB GPU per rank.
+        if hasattr(draft_model, "midlayer") and hasattr(draft_model.midlayer, "mlp"):
+            draft_model.midlayer.mlp._grad_checkpoint = True
+            print_on_rank0(
+                "[grad-checkpoint] Enabled gradient checkpointing on draft MLP"
+            )
+        else:
+            print_on_rank0(
+                "[grad-checkpoint] WARN: --draft-mlp-grad-checkpoint requested "
+                "but draft_model has no .midlayer.mlp; ignoring"
+            )
     target_model, processor = build_target_model(args, draft_model_config, is_online)
 
     # ================================================
