@@ -88,6 +88,68 @@ even with pairing-aware sorting. Translates to **~9.5 h for stage 1
 benefit)** = **~24 h end-to-end at L=32k**, still ~40% faster
 than the L=65k baseline would have been.
 
+### Active session state (2026-04-08, mid stage 1)
+
+* **Wandb run**: `stage1-L32768-ttt6-sw4k-bucketed`, id `0fkrs68u` at
+  `wandb.ai/hav4ik/nemotron-cascade-2-eagle3/runs/0fkrs68u`
+* **Training process**: PID owned by an init-orphan torchrun (use
+  `ps -ef | grep train_eagle3` to find it). Disowned, will survive
+  shell exits. To stop cleanly: `pkill -INT -f torch.distributed.run`,
+  wait 10s, then `pkill -9 -f train_eagle3` if needed.
+* **Auto-push watcher**: `auto_push_checkpoints.sh` running in
+  background, polling `$WORK_DIR/checkpoints/nemotron-cascade-2-eagle3-stage1`
+  every 60s. Pushes each new step to (a) `chankhavu/c2.eagle3-test` `main`
+  branch (latest only) and (b) a tagged branch `stage1-step-NNNN` so
+  history is preserved on the HF repo. State files at
+  `$WORK_DIR/.pushed_checkpoints_stage1*`. Logs to
+  `$WORK_DIR/logs/auto_push.log`. To stop:
+  `pkill -f auto_push_checkpoints.sh`.
+* **Published HF model**: https://huggingface.co/chankhavu/c2.eagle3-test
+  -- mid-training test artifact, NOT a final shippable head. The repo
+  has the latest checkpoint on `main` and per-step tagged branches
+  (`stage1-step-2000`, `stage1-step-4000`, ...).
+* **Verifier weights are at `/workspace/models/`** (NOT `/workspace/.hf_home/`).
+  All launchers should set `export HF_HOME=/workspace/models` before
+  running, otherwise HF will try to re-download the 63 GB verifier into
+  the wrong cache and fail with "not enough disk space" (we only have
+  ~30 GB free total). The launchers respect an existing `HF_HOME` env
+  var via `${HF_HOME:-...}`, so the export must happen at the shell
+  level before invoking `bash run_train_*.sh`.
+
+### Bugs found in upstream SpecForge that affect this run
+
+1. **`print_on_rank0` uses `logger.info` but no `basicConfig`** is
+   ever called -- so all `logger.info` messages are silently dropped
+   below the default `WARNING` level. The eval per-position metric
+   prints (`Eval - Step N, position i, Acc: ...`) you'd expect to see
+   in the local log file are NOT there. The metrics ARE logged to
+   wandb (via `tracker.log`), so wandb is the source of truth for eval
+   numbers. Don't try to grep the train log for `Acc:` -- you won't
+   find anything. Pull metrics via the wandb API instead:
+   ```python
+   import wandb
+   api = wandb.Api()
+   run = api.run("hav4ik/nemotron-cascade-2-eagle3/0fkrs68u")
+   for r in run.scan_history():
+       for k, v in r.items():
+           if k.startswith("eval_l"):
+               print(k, v)
+   ```
+   The fix would be a one-liner (`logging.basicConfig(level=logging.INFO)`
+   somewhere in `train_eagle3.py`'s init), but I haven't shipped it
+   because I don't want to mid-run patch the train script and possibly
+   crash the running job. Tracked for the next iteration.
+
+2. **Vocab mapping silently overwritten across stages** -- see the
+   "vocab mapping" section below. Already fixed in this fork via the
+   `--vocab-mapping-path` flag and `build_union_vocab_mapping.py`
+   script. The fix is critical: without it, stage 2 would silently
+   train against a misaligned lm_head index space and converge to a
+   worse minimum.
+
+3. **`dataset.map(num_proc=32)` hangs on tiny eval sets** (539 rows).
+   See the gotcha section below.
+
 ### Common gotcha: num_proc=32 hangs on small eval datasets
 
 The validation set (`c2_traces_validation.jsonl`, 539 rows) hangs
@@ -248,9 +310,12 @@ CKPT_DIR=$WORK_DIR/checkpoints/nemotron-cascade-2-eagle3-stage1/epoch_0_step_<N>
     2>&1 | tee /workspace/eagle3_training/logs/train_stage2.log
 ```
 
-## First 5 minutes on a new instance
+## First 5 minutes on a new instance (current iteration: 2-stage L=32k)
 
-If you're picking this up on a fresh box with the GPUs already provisioned:
+If you're picking this up on a fresh box with the GPUs already provisioned,
+this is the COMPLETE boot sequence to reproduce / continue the in-flight
+2-stage L=32k iteration. Read the "Current iteration plan" and "Bugs found
+in upstream SpecForge" sections BEFORE running.
 
 ```bash
 # 1. Clone this branch (the source of truth)
@@ -270,26 +335,96 @@ pip install mamba-ssm --no-build-isolation
 
 # 3. Login to wandb (the user's project lives at hav4ik/nemotron-cascade-2-eagle3)
 wandb login                # paste API key from wandb.ai/settings
-# (HuggingFace login is NOT needed -- all models/datasets used are public)
+hf auth login              # paste HF token; needed to push checkpoints to chankhavu/c2.eagle3-test
 
 # 4. Pick a workspace dir on big-disk storage
-export WORK_DIR=/scratch/nemotron-eagle3
+export WORK_DIR=$(pwd)/eagle3-work    # or /scratch/nemotron-eagle3
 
-# 5. Download data (~2 min, ~80 MB)
-bash experiments/nemotron-cascade-2/prepare_data.sh
+# CRITICAL: HF_HOME must point at the dir that already holds the
+# 63 GB Nemotron-Cascade-2 verifier. On the previous instance it was
+# /workspace/models. Otherwise HF will try to redownload and fail
+# (we typically have <30 GB free total).
+export HF_HOME=/workspace/models  # or wherever the verifier is cached
 
-# 6. Build cache (~5-10 min CPU work, no GPUs needed)
-bash experiments/nemotron-cascade-2/build_cache.sh
+# 5. Stage 1 prep (also stages c2_traces_validation.jsonl into $WORK_DIR/data/)
+bash experiments/nemotron-cascade-2/prepare_data_stage1.sh
 
-# 7. Launch the long-context training (the run we left in flight)
-bash experiments/nemotron-cascade-2/run_train_sw4k.sh
-# Open the wandb URL printed near the top of the log to monitor
+# 6. Stage 2 prep (must run BEFORE union vocab mapping builder so it has
+#    both data files to scan)
+bash experiments/nemotron-cascade-2/prepare_data_stage2.sh
 
-# 8. (Optional) Push commits back to this fork:
-#    PAT credentials are NOT stored in the repo. Ask @hav4ik for a fresh
-#    fine-grained PAT scoped to hav4ik/SpecForge-Nemotron3, then push via:
-#    git push https://hav4ik:$PAT@github.com/hav4ik/SpecForge-Nemotron3.git \
-#        nemotron-cascade-2-experiments
+# 7. Build BOTH train caches (needed by union vocab builder for cache hits)
+CACHE_DIR=$WORK_DIR/cache_l32768 MAX_LENGTH=32768 EXPERIMENT=sw4k \
+    TRAIN_DATA=$WORK_DIR/data/all_data_stage1.jsonl \
+    bash experiments/nemotron-cascade-2/build_cache.sh
+CACHE_DIR=$WORK_DIR/cache_l32768 MAX_LENGTH=32768 EXPERIMENT=sw4k \
+    TRAIN_DATA=$WORK_DIR/data/all_data_stage2.jsonl \
+    bash experiments/nemotron-cascade-2/build_cache.sh
+
+# 8. Pre-build the 3 EVAL caches at L=16k/32k/64k. Must use --num-proc 8
+#    (NOT 32) -- the in-train auto-build hangs on the 539-row eval set
+#    with num_proc=32. See "num_proc=32 hangs" gotcha below.
+for L in 16384 32768 65536; do
+    python experiments/nemotron-cascade-2/build_cache_offline.py \
+        --target-model-path nvidia/Nemotron-Cascade-2-30B-A3B \
+        --draft-model-config configs/nemotron-cascade-2-eagle3-sw4k.json \
+        --train-data-path $WORK_DIR/data/c2_traces_validation.jsonl \
+        --chat-template nemotron-h \
+        --max-length $L \
+        --cache-dir $WORK_DIR/cache_l32768 \
+        --num-proc 8 \
+        --trust-remote-code
+done
+
+# 9. Build the UNION vocab mapping. CRITICAL: stage 1 and stage 2 must
+#    share the same d2t/t2d mapping or the lm_head index space gets
+#    silently scrambled at the stage 2 transition. See "vocab mapping"
+#    section below for the full bug story.
+python experiments/nemotron-cascade-2/build_union_vocab_mapping.py \
+    --target-model-path nvidia/Nemotron-Cascade-2-30B-A3B \
+    --draft-model-config configs/nemotron-cascade-2-eagle3-sw4k.json \
+    --stage1-data-path $WORK_DIR/data/all_data_stage1.jsonl \
+    --stage2-data-path $WORK_DIR/data/all_data_stage2.jsonl \
+    --max-length 32768 \
+    --chat-template nemotron-h \
+    --cache-dir $WORK_DIR/cache_l32768 \
+    --output-path $WORK_DIR/data/union_vocab_mapping_l32k.pt \
+    --num-proc 32 \
+    --trust-remote-code
+
+# 10. Launch stage 1 training. Logs to /workspace/eagle3_training/logs/.
+bash experiments/nemotron-cascade-2/run_train_stage1.sh \
+    > /workspace/eagle3_training/logs/train_stage1.log 2>&1 &
+disown
+
+# 11. Launch the auto-push watcher in background. Pushes each new
+#     checkpoint to chankhavu/c2.eagle3-test (main = latest, tagged
+#     branches preserve history).
+nohup bash experiments/nemotron-cascade-2/auto_push_checkpoints.sh \
+    > $WORK_DIR/logs/auto_push.log 2>&1 &
+disown
+
+# 12. Monitor:
+tail -f /workspace/eagle3_training/logs/train_stage1.log
+tail -f $WORK_DIR/logs/auto_push.log
+# Or watch wandb: https://wandb.ai/hav4ik/nemotron-cascade-2-eagle3
+
+# 13. After stage 1 finishes, find the deepest checkpoint and launch stage 2:
+ls $WORK_DIR/checkpoints/nemotron-cascade-2-eagle3-stage1/
+CKPT_DIR=$WORK_DIR/checkpoints/nemotron-cascade-2-eagle3-stage1/epoch_0_step_10000 \
+    bash experiments/nemotron-cascade-2/run_train_stage2.sh \
+    > /workspace/eagle3_training/logs/train_stage2.log 2>&1 &
+disown
+# Restart auto-push watcher for stage 2:
+STAGE=stage2 nohup bash experiments/nemotron-cascade-2/auto_push_checkpoints.sh \
+    > $WORK_DIR/logs/auto_push_stage2.log 2>&1 &
+disown
+
+# 14. (Optional) Push commits back to this fork:
+#     PAT credentials are NOT stored in the repo. Ask @hav4ik for a fresh
+#     fine-grained PAT scoped to hav4ik/SpecForge-Nemotron3, then push via:
+#     git push https://hav4ik:$PAT@github.com/hav4ik/SpecForge-Nemotron3.git \
+#         nemotron-cascade-2-experiments
 ```
 
 ## What transfers across instances vs what doesn't
