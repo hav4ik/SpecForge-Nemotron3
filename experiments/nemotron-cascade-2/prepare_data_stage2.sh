@@ -10,10 +10,15 @@
 # Sources of stage-2 data, all concatenated:
 #   1. c2_traces_train.jsonl (~9.6k on-policy reasoning traces, T=1.0
 #      top_p=0.95)
-#   2. c2_traces_cot_train.jsonl (~0.9k on-policy chain-of-thought
-#      reasoning traces)
-#   3. Any *.jsonl files placed under $WORK_DIR/data/extra_traces/
+#   2. Any *.jsonl files placed under $WORK_DIR/data/extra_traces/
 #      (optional; for adding additional rollouts)
+#
+# NOT included (intentionally, as of 2026-04-08):
+#   * c2_traces_cot_train.jsonl -- the CoT traces have substantially
+#     higher mean tokens-per-sample than the plain traces, which makes
+#     stage 2 wall-clock much slower. We're prioritizing fast iteration
+#     for the first baseline; if the deployed draft underperforms on
+#     CoT-heavy reasoning later, fold this back in.
 #
 # Output:
 #   $WORK_DIR/data/all_data_stage2.jsonl  (concatenated and pre-shuffled
@@ -48,7 +53,7 @@ with open(os.path.join(os.environ.get("WORK_DIR", "."), "data", ".dataset_path")
 PY
 
 DATA=$(cat "$WORK_DIR/data/.dataset_path")
-echo "[prepare-data-stage2] base traces files: $DATA/c2_traces_train.jsonl + c2_traces_cot_train.jsonl"
+echo "[prepare-data-stage2] base traces file: $DATA/c2_traces_train.jsonl (CoT set excluded for fast iteration)"
 
 EXTRA_FILES=()
 if compgen -G "$WORK_DIR/data/extra_traces/*.jsonl" > /dev/null; then
@@ -63,7 +68,6 @@ fi
 
 cat \
     "$DATA/c2_traces_train.jsonl" \
-    "$DATA/c2_traces_cot_train.jsonl" \
     "${EXTRA_FILES[@]}" \
     | shuf --random-source=<(yes 42) \
     > "$WORK_DIR/data/all_data_stage2.jsonl"
