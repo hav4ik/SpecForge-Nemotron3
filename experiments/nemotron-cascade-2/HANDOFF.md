@@ -12,6 +12,66 @@ context Eagle3 draft head trained on a hybrid Mamba-Transformer verifier.
 optionally pushing to L=131072 with FSDP2 verifier sharding, and pushing
 the trained checkpoint to HF when it's ready.**
 
+## First 5 minutes on a new instance
+
+If you're picking this up on a fresh box with the GPUs already provisioned:
+
+```bash
+# 1. Clone this branch (the source of truth)
+git clone -b nemotron-cascade-2-experiments \
+    https://github.com/hav4ik/SpecForge-Nemotron3.git
+cd SpecForge-Nemotron3
+
+# 2. Install (use the existing env if /venv/main exists; otherwise create
+#    a fresh one with python>=3.11 and the deps listed in README.md
+#    "Environment" section)
+pip install -e . --no-deps
+pip install datasets tensorboard wandb yunchang  # the few light deps we need
+# mamba_ssm + causal_conv1d are needed for the verifier's Mamba fast path
+# but the slow path also works -- skip them if the build fails on your CUDA
+pip install causal-conv1d --no-build-isolation
+pip install mamba-ssm --no-build-isolation
+
+# 3. Login to wandb (the user's project lives at hav4ik/nemotron-cascade-2-eagle3)
+wandb login                # paste API key from wandb.ai/settings
+# (HuggingFace login is NOT needed -- all models/datasets used are public)
+
+# 4. Pick a workspace dir on big-disk storage
+export WORK_DIR=/scratch/nemotron-eagle3
+
+# 5. Download data (~2 min, ~80 MB)
+bash experiments/nemotron-cascade-2/prepare_data.sh
+
+# 6. Build cache (~5-10 min CPU work, no GPUs needed)
+bash experiments/nemotron-cascade-2/build_cache.sh
+
+# 7. Launch the long-context training (the run we left in flight)
+bash experiments/nemotron-cascade-2/run_train_sw4k.sh
+# Open the wandb URL printed near the top of the log to monitor
+
+# 8. (Optional) Push commits back to this fork:
+#    PAT credentials are NOT stored in the repo. Ask @hav4ik for a fresh
+#    fine-grained PAT scoped to hav4ik/SpecForge-Nemotron3, then push via:
+#    git push https://hav4ik:$PAT@github.com/hav4ik/SpecForge-Nemotron3.git \
+#        nemotron-cascade-2-experiments
+```
+
+## What transfers across instances vs what doesn't
+
+| Thing | Where it lives | Re-create how |
+|---|---|---|
+| **All code + configs + docs** | This branch on github.com/hav4ik/SpecForge-Nemotron3 | `git clone -b nemotron-cascade-2-experiments` |
+| **Numerical equivalence test for chunked fused loss** | `specforge/core/loss.py` `__main__` block | `python specforge/core/loss.py` (needs 1 GPU, ~10 sec) |
+| **Wandb runs / loss curves** | wandb.ai/hav4ik/nemotron-cascade-2-eagle3 | (cloud, persistent) |
+| **Training data** | huggingface.co/datasets/chankhavu/c2_eagle3_train | `prepare_data.sh` re-downloads |
+| **Verifier weights (~63 GB)** | huggingface.co/nvidia/Nemotron-Cascade-2-30B-A3B | HF auto-downloads on first run; ~10 min |
+| **Tokenized cache** | local disk (`$WORK_DIR/cache/`) | `build_cache.sh` rebuilds in ~5-10 min |
+| **Trained draft checkpoints** | local disk (`$WORK_DIR/checkpoints/`) | **Lost on instance teardown unless pushed to HF.** Re-train from scratch (~hours) |
+| **My conversation history with @hav4ik** | (claude.ai session) | (lost) -- this HANDOFF + README + commit messages are the canonical record of decisions |
+| **My auto-memory** | `/root/.claude/projects/-workspace/memory/` | (lost) -- nothing critical was stored there for this project |
+| **PAT token for git push** | (was in chat once) | Ask @hav4ik for a fresh fine-grained PAT scoped only to the fork |
+| **Wandb API key** | (in @hav4ik's wandb account) | `wandb login` and paste from wandb.ai/settings |
+
 ## Current run (as of this commit)
 
 * **Experiment**: `sw4k` (long-context + sliding window 4k + grad-ckpt
