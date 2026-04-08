@@ -104,6 +104,25 @@ than the L=65k baseline would have been.
   `$WORK_DIR/.pushed_checkpoints_stage1*`. Logs to
   `$WORK_DIR/logs/auto_push.log`. To stop:
   `pkill -f auto_push_checkpoints.sh`.
+* **Stage 2 auto-launch orchestrator**: `auto_launch_stage2.sh`
+  running in background. Polls every 60s for the stage 1 final
+  checkpoint (`epoch_0_step_10000`) AND verifies no train_eagle3 /
+  torch.distributed.run processes are still alive (so we don't race
+  the final-save). When stage 1 completes:
+    1. waits a 60s grace period for in-flight writes to flush
+    2. re-verifies stage 2 prerequisites (data file, cache, union
+       vocab mapping) are still in place
+    3. kills the stage 1 auto-push watcher
+    4. starts a stage 2 auto-push watcher (STAGE=stage2)
+    5. launches `run_train_stage2.sh` with `CKPT_DIR` pointed at the
+       stage 1 final checkpoint, logging to
+       `/workspace/eagle3_training/logs/train_stage2.log`
+    6. exits
+  Logs to `$WORK_DIR/logs/auto_launch_stage2.log`. To stop:
+  `pkill -f auto_launch_stage2.sh` (must be done BEFORE stage 1
+  finishes or stage 2 will launch). The orchestrator MUST be
+  invoked with `HF_HOME=/workspace/models` exported, otherwise the
+  stage 2 launch will try to redownload the verifier.
 * **Published HF model**: https://huggingface.co/chankhavu/c2.eagle3-test
   -- mid-training test artifact, NOT a final shippable head. The repo
   has the latest checkpoint on `main` and per-step tagged branches
