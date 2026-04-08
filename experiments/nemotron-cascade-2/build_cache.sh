@@ -27,6 +27,13 @@ TRAIN_DATA=${TRAIN_DATA:-$WORK_DIR/data/all_data_shuffled.jsonl}
 TARGET_MODEL=${TARGET_MODEL:-nvidia/Nemotron-Cascade-2-30B-A3B}
 NUM_PROC=${NUM_PROC:-32}
 EXPERIMENT=${EXPERIMENT:-sw4k}
+# CACHE_DIR can be overridden to keep separate cache trees per max_length
+# (e.g. CACHE_DIR=$WORK_DIR/cache_l32k for the L=32768 fast-iteration
+# experiment, $WORK_DIR/cache_l65k for the long-context one). The dataset
+# hash already disambiguates by max_length so co-locating is safe, but
+# splitting the trees makes them easier to inspect / clean up between
+# iterations.
+CACHE_DIR=${CACHE_DIR:-$WORK_DIR/cache}
 
 case "$EXPERIMENT" in
     baseline)
@@ -43,7 +50,7 @@ case "$EXPERIMENT" in
         ;;
 esac
 
-mkdir -p "$WORK_DIR/cache" "$WORK_DIR/logs"
+mkdir -p "$CACHE_DIR" "$WORK_DIR/logs"
 
 export HF_HOME=${HF_HOME:-$WORK_DIR/hf_home}
 export TOKENIZERS_PARALLELISM=false
@@ -53,7 +60,7 @@ echo "[build-cache] TRAIN_DATA=$TRAIN_DATA"
 echo "[build-cache] DRAFT_CONFIG=$DRAFT_CONFIG"
 echo "[build-cache] MAX_LENGTH=$MAX_LENGTH"
 echo "[build-cache] NUM_PROC=$NUM_PROC"
-echo "[build-cache] CACHE_DIR=$WORK_DIR/cache"
+echo "[build-cache] CACHE_DIR=$CACHE_DIR"
 
 python "$SCRIPT_DIR/build_cache_offline.py" \
     --target-model-path "$TARGET_MODEL" \
@@ -61,6 +68,6 @@ python "$SCRIPT_DIR/build_cache_offline.py" \
     --train-data-path "$TRAIN_DATA" \
     --chat-template nemotron-h \
     --max-length "$MAX_LENGTH" \
-    --cache-dir "$WORK_DIR/cache" \
+    --cache-dir "$CACHE_DIR" \
     --num-proc "$NUM_PROC" \
     --trust-remote-code

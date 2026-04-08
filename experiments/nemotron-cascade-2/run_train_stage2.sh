@@ -52,6 +52,7 @@ NUM_GPUS=${NUM_GPUS:-2}
 NUM_EPOCHS=${NUM_EPOCHS:-3}
 LEARNING_RATE=${LEARNING_RATE:-5e-5}
 MAX_LENGTH=${MAX_LENGTH:-32768}
+CACHE_DIR=${CACHE_DIR:-$WORK_DIR/cache_l${MAX_LENGTH}}
 
 if [[ -z "${CKPT_DIR:-}" ]]; then
     echo "ERROR: CKPT_DIR must be set to the stage-1 checkpoint directory." >&2
@@ -70,7 +71,7 @@ if [[ ! -f "$CKPT_DIR/config.json" || ! -f "$CKPT_DIR/model.safetensors" ]]; the
     exit 2
 fi
 
-mkdir -p "$WORK_DIR/cache" "$WORK_DIR/checkpoints" "$WORK_DIR/logs"
+mkdir -p "$CACHE_DIR" "$WORK_DIR/checkpoints" "$WORK_DIR/logs"
 
 export HF_HOME=${HF_HOME:-$WORK_DIR/hf_home}
 export TOKENIZERS_PARALLELISM=false
@@ -96,7 +97,7 @@ python -m torch.distributed.run \
     --eval-lengths 16384,32768,65536 \
     --eval-interval 1000 \
     --chat-template nemotron-h \
-    --cache-dir "$WORK_DIR/cache" \
+    --cache-dir "$CACHE_DIR" \
     --output-dir "$WORK_DIR/checkpoints/nemotron-cascade-2-eagle3-stage2" \
     --ckpt-dir "$CKPT_DIR" \
     --num-epochs "$NUM_EPOCHS" \
@@ -104,7 +105,6 @@ python -m torch.distributed.run \
     --learning-rate "$LEARNING_RATE" \
     --max-length "$MAX_LENGTH" \
     --ttt-length 6 \
-    --draft-mlp-grad-checkpoint \
     --draft-mlp-chunk-size 4096 \
     --fused-linear-loss \
     --fused-linear-loss-chunk-size 4096 \

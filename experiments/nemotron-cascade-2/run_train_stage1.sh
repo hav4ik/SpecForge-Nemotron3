@@ -61,8 +61,9 @@ TARGET_MODEL=${TARGET_MODEL:-nvidia/Nemotron-Cascade-2-30B-A3B}
 NUM_GPUS=${NUM_GPUS:-2}
 NUM_EPOCHS=${NUM_EPOCHS:-1}
 MAX_LENGTH=${MAX_LENGTH:-32768}
+CACHE_DIR=${CACHE_DIR:-$WORK_DIR/cache_l${MAX_LENGTH}}
 
-mkdir -p "$WORK_DIR/cache" "$WORK_DIR/checkpoints" "$WORK_DIR/logs"
+mkdir -p "$CACHE_DIR" "$WORK_DIR/checkpoints" "$WORK_DIR/logs"
 
 export HF_HOME=${HF_HOME:-$WORK_DIR/hf_home}
 export TOKENIZERS_PARALLELISM=false
@@ -86,14 +87,13 @@ python -m torch.distributed.run \
     --eval-interval 1000 \
     --with-data-bucketing \
     --chat-template nemotron-h \
-    --cache-dir "$WORK_DIR/cache" \
+    --cache-dir "$CACHE_DIR" \
     --output-dir "$WORK_DIR/checkpoints/nemotron-cascade-2-eagle3-stage1" \
     --num-epochs "$NUM_EPOCHS" \
     --batch-size 1 \
     --learning-rate 1e-4 \
     --max-length "$MAX_LENGTH" \
     --ttt-length 6 \
-    --draft-mlp-grad-checkpoint \
     --draft-mlp-chunk-size 4096 \
     --fused-linear-loss \
     --fused-linear-loss-chunk-size 4096 \
