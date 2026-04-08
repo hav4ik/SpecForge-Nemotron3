@@ -8,9 +8,117 @@ first**, then `README.md` for the engineering rationale, then `git log
 If you're a future-me reading this without the conversation history: this
 folder is the current state of a multi-day debugging effort to get a long-
 context Eagle3 draft head trained on a hybrid Mamba-Transformer verifier.
-**The training engineering is done; what remains is monitoring the run,
-optionally pushing to L=131072 with FSDP2 verifier sharding, and pushing
-the trained checkpoint to HF when it's ready.**
+**The training engineering is done; what remains is launching the
+2-stage training described below, monitoring the run, and pushing the
+trained checkpoint to HF when it's ready.**
+
+## Current iteration plan (2026-04-08)
+
+**TL;DR**: Get a working baseline draft out the door fast at L=32768,
+then iterate up to L=65536 in a follow-up.
+
+We pivoted away from the L=65536 single-pool training that was running
+in the previous iteration (commit `db952f7` and earlier wandb runs
+named `sw4k-L65k-ttt6-fused-mixed`). The new plan:
+
+* **L=32768** (down from 65536) -- each step is roughly half the cost,
+  and the SFT pool mostly fits under 32k anyway. We pay a long-context
+  generalization cost we'll measure via the per-length eval set
+  (16k/32k/64k); if the gap is small, we ship from L=32k. If it's
+  large, we re-train at L=65k after the baseline lands.
+* **2-stage schedule**:
+  1. Stage 1 (`run_train_stage1.sh`): 1 epoch over
+     `cascade2_sft_train.jsonl` (~20k SFT rows, plus anything dropped
+     into `data/extra_sft/`), lr=1e-4, **with `--with-data-bucketing`**
+     (DP=2 + B=1 makes the straggler-rank bottleneck huge on a wide
+     length distribution; bucketing kills it).
+  2. Stage 2 (`run_train_stage2.sh`): 2-3 epochs (default 3) over
+     `c2_traces_train.jsonl` ONLY (~9.6k rows; the CoT set
+     `c2_traces_cot_train.jsonl` is excluded because it has higher
+     mean tokens-per-sample and would slow stage 2). lr=5e-5, NO
+     bucketing (we want gradient diversity per step on the on-policy
+     distribution we're specializing to). Loaded from the stage 1
+     checkpoint via `--ckpt-dir` (weight-only, fresh optimizer).
+* **`--draft-mlp-grad-checkpoint` is now OFF**. It was needed at
+  L=65536 ttt=7 to fit on a 96GB GPU; at L=32768 we have plenty of
+  headroom and grad-checkpointing the MLP costs ~25-30% on the draft
+  forward. We still keep `--draft-mlp-chunk-size 4096` (cheap,
+  defends transient peak) and `--fused-linear-loss` (still saves
+  ~14 GiB at L=32k from the [B,T,V] logits buffer).
+* **Multi-length eval**: both stage launchers pass
+  `--eval-lengths 16384,32768,65536 --eval-data-path ...c2_traces_validation.jsonl`
+  every 1000 steps. The train script builds 3 independent eval
+  dataloaders (one per length cap) and logs per-length metrics to
+  wandb under `eval_l16384/*`, `eval_l32768/*`, `eval_l65536/*`. This
+  is how we measure long-context generalization without training at
+  long context.
+* **Per-length cache dirs**: `build_cache.sh` and both stage launchers
+  honor a `CACHE_DIR` env var, defaulting to
+  `$WORK_DIR/cache_l${MAX_LENGTH}` so caches at different lengths
+  don't collide and are easy to inspect / clean up.
+
+### Expected step times at L=32768 on 2x RTX PRO 6000 Blackwell
+
+Reference: the L=65536 ttt=6 + grad-ckpt run measured **~4.1 s/step
+running average** (high variance: 1.2s on short samples, 8.6s on near-
+max-length samples, dragged up by the straggler-rank pairing problem).
+
+Estimate for the new L=32k + bucketing + no-grad-ckpt setup:
+
+| change | expected effect |
+|---|---|
+| L=65536 -> 32768 | -40 to -50% per step (activation memory ~halves; attention is sliding-window 4k so it scales sub-linearly, MLP is fully linear in seq) |
+| no `--draft-mlp-grad-checkpoint` | -8 to -12% on total step (recovers the ~25% MLP-fwd recompute cost; MLP is ~30-40% of step) |
+| `--with-data-bucketing` (stage 1 only) | -10 to -20% on stage 1 mean step time (eliminates straggler-rank waste; benefit shrinks as length variance does, so ~0% for stage 2) |
+| **net stage 1 estimate** | **~1.5 - 2.0 s/step** |
+| **net stage 2 estimate** | **~1.7 - 2.2 s/step** (no bucketing benefit) |
+
+At ~1.7 s/step, ~10000 stage 1 steps -> **~5h**, and ~14500 stage 2
+steps (3 epochs over ~9.6k rows on DP=2) -> **~7h**, totaling
+**~12 h end-to-end**. These numbers should be re-measured once the
+first ~200 steps land and the running average stabilizes; update this
+table with the actual.
+
+### Reverted experimental knobs (and why)
+
+* **Length bucketing was previously OFF** (we removed it after the
+  user pushed back about gradient bias from per-step difficulty
+  drift). It's back ON for stage 1 only because: (a) the user is
+  cleaning the data to filter out samples below 1024 tokens, which
+  bounds the worst-case length-ratio within a bucket; (b) the
+  per-epoch global-batch-order shuffle in our
+  `LengthBucketDistributedSampler` mitigates the drift; (c) stage 2
+  runs un-bucketed and corrects any residual bias from stage 1.
+* **CoT set excluded from stage 2 (this iteration only)**. Higher
+  tokens-per-sample. Re-add in a follow-up stage 2 fine-tune if the
+  baseline draft underperforms on CoT-heavy reasoning.
+* **L=131072 + FSDP2 verifier sharding** is shelved indefinitely.
+  We'll consider it after the L=32k baseline ships.
+
+### Recommended next-agent runbook (current iteration)
+
+```bash
+cd $SPECFORGE_ROOT
+export WORK_DIR=$(pwd)/eagle3-work   # or your scratch dir
+
+# Stage 1
+bash experiments/nemotron-cascade-2/prepare_data_stage1.sh
+TRAIN_DATA=$WORK_DIR/data/all_data_stage1.jsonl \
+    bash experiments/nemotron-cascade-2/build_cache.sh
+bash experiments/nemotron-cascade-2/run_train_stage1.sh \
+    2>&1 | tee /workspace/eagle3_training/logs/train_stage1.log
+
+# After stage 1 finishes, find the deepest checkpoint:
+ls $WORK_DIR/checkpoints/nemotron-cascade-2-eagle3-stage1/
+
+# Stage 2 (loads stage1 weights, fresh optimizer)
+bash experiments/nemotron-cascade-2/prepare_data_stage2.sh
+TRAIN_DATA=$WORK_DIR/data/all_data_stage2.jsonl \
+    bash experiments/nemotron-cascade-2/build_cache.sh
+CKPT_DIR=$WORK_DIR/checkpoints/nemotron-cascade-2-eagle3-stage1/epoch_0_step_<N> \
+    bash experiments/nemotron-cascade-2/run_train_stage2.sh \
+    2>&1 | tee /workspace/eagle3_training/logs/train_stage2.log
+```
 
 ## First 5 minutes on a new instance
 
