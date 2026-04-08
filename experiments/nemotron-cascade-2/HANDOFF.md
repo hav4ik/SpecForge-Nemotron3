@@ -356,6 +356,20 @@ pip install mamba-ssm --no-build-isolation
 wandb login                # paste API key from wandb.ai/settings
 hf auth login              # paste HF token; needed to push checkpoints to chankhavu/c2.eagle3-test
 
+# 3a. CRITICAL: hf auth login writes the token to ~/.cache/huggingface/token
+#     OR /workspace/.hf_home/token (depending on what HF_HOME is set to AT
+#     LOGIN TIME). The auto-push watcher inherits HF_HOME=/workspace/models
+#     from the train launchers, so it looks for the token at
+#     /workspace/models/token, which won't exist by default. Either:
+#       (a) `hf auth login` again with HF_HOME=/workspace/models exported,
+#           OR
+#       (b) copy/symlink the existing token file:
+#           cp /workspace/.hf_home/token /workspace/models/token
+#     Without this step, all auto-push attempts will fail with
+#     "Invalid username or password" inside the watcher (the watcher
+#     will keep retrying every 60s, so the failure is non-fatal but
+#     nothing reaches the HF repo).
+
 # 4. Pick a workspace dir on big-disk storage
 export WORK_DIR=$(pwd)/eagle3-work    # or /scratch/nemotron-eagle3
 
