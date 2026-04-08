@@ -195,6 +195,90 @@ done
 After that the train script's auto-build path hits the cache and
 skips the slow path entirely.
 
+### Version 2 (next iteration) -- planned changes
+
+The current run is the **V1 baseline**: get a working draft head shipped
+fast, learn what doesn't work, then iterate. V2 should incorporate the
+following changes once V1 lands and we have eval numbers to compare
+against:
+
+1. **Re-include `c2_traces_cot_train.jsonl` in stage 2.**
+   The 908 CoT traces (~50k mean tokens/row, vs ~21k for the regular
+   traces) were excluded from V1 to keep stage 2 wall-clock down. They
+   should come back for V2 because:
+   * Reasoning-trace coverage is the explicit motivation for stage 2's
+     existence; CoT is the longest-form, most-reasoning-heavy subset.
+   * V2 trains at L=65536 (see #2 below), which absorbs the longer CoT
+     samples without truncation, so the per-sample wall-clock penalty
+     is proportionally smaller than at L=32k.
+   * V1's exclusion is documented as "fast iteration only" in
+     `prepare_data_stage2.sh` -- the comment block already says to
+     fold this back in for V2.
+
+2. **Push `max_length` from 32768 to 65536.**
+   V1 truncates ~26% of stage 1 SFT tokens and ~15% of stage 2 traces.
+   The whole point of the engineering work in this fork (chunked MLP,
+   fused linear loss, sliding window) was to make L=65536 fit on
+   96 GB GPUs, and V1 deliberately backed off to L=32k to validate
+   the pipeline first. V2 should re-enable the L=65k path:
+   * Re-enable `--draft-mlp-grad-checkpoint` (it's required to fit at
+     L=65k + ttt>=6 on 96 GB; V1 disabled it because L=32k has
+     headroom).
+   * Per-step time at L=65k is roughly 1.5-2x the L=32k cost, so
+     re-budget wall-clock accordingly.
+
+3. **Bump `ttt_length` from 6 to 7.**
+   ttt=7 is the Eagle3 paper / SGLang reference default. V1 dropped
+   to ttt=6 purely as a memory workaround at L=65k before the chunked
+   MLP commit landed (the original L=65k+ttt=7 attempt OOM'd by 64 MiB).
+   With both grad-ckpt re-enabled and the chunked MLP / fused loss
+   stack active, ttt=7 should fit at L=65k. The extra TTT step is
+   expected to add ~0.5 token to the mean accept length at inference,
+   per the diminishing-returns curve in the Eagle3 paper.
+
+4. **Add more stage 1 SFT data**, especially **tool-use-heavy
+   conversations.** V1's stage 1 is just the 20k cascade2_sft_train
+   pool, which is mostly chat/instruction-following. The user has
+   indicated they want to expand the SFT pool with more diverse data,
+   particularly tool-use SFT, to improve generalization on
+   tool-calling reasoning traces (which are common at inference but
+   under-represented in V1 training).
+   * Drop additional `*.jsonl` files into `$WORK_DIR/data/extra_sft/`
+     and re-run `prepare_data_stage1.sh`. The data prep script
+     auto-concatenates everything in that dir.
+   * Re-run the union vocab mapping builder so the larger pool's
+     token frequencies are incorporated into the d2t / t2d mapping.
+   * Each additional 5k SFT rows adds roughly 5-7 hours of stage 1
+     wall-clock at L=65k.
+
+5. **Possibly bump `num_speculative_tokens` at inference**, depending
+   on V2's training-time TTT length and the per-position acc curve.
+   With ttt=7 the inference protocol can speculate 6-7 tokens ahead
+   instead of V1's 5.
+
+6. **Multi-length eval should keep validating long-context
+   generalization.** The V1 multi-length eval (16k/32k/64k) lets us
+   measure whether L=32k training generalizes to longer contexts at
+   inference. V2's L=65k training should match or exceed V1 on the
+   16k/32k buckets and improve on the 64k bucket. If V1's 16k/32k
+   eval numbers are already strong enough, the L=65k retrain may
+   not be worth the wall-clock cost.
+
+**Decision criteria for whether V2 is worth doing**: after V1 ships,
+look at:
+* `eval_l16384/acc_*` vs `eval_l32768/acc_*` vs `eval_l65536/acc_*`
+  in the V1 wandb run -- if the L=64k bucket significantly underperforms
+  the shorter buckets, V2's L=65k retrain is justified.
+* Inference acceptance rate on a CoT-heavy benchmark (math/coding) --
+  if it's notably worse than on plain reasoning, V2's CoT inclusion is
+  justified.
+* Mean accept length at inference -- if it's well below the
+  ~4.0-4.5 token target for stage 2 (see earlier estimates section),
+  V2's ttt=7 + more data is justified.
+
+If V1 hits all three targets, V2 is optional polish rather than
+required.
+
 ### Reverted experimental knobs (and why)
 
 * **Length bucketing was previously OFF** (we removed it after the
