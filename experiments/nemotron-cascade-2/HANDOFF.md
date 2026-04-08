@@ -95,26 +95,107 @@ table with the actual.
 * **L=131072 + FSDP2 verifier sharding** is shelved indefinitely.
   We'll consider it after the L=32k baseline ships.
 
+### CRITICAL: vocab mapping must be UNION across stages
+
+Eagle3's draft head predicts logits over a smaller draft vocabulary
+(`draft_vocab_size = 32000` here, vs `target_vocab_size = 131072`).
+The mapping (`d2t` / `t2d` buffers on the draft model) is the top-K
+most frequent target tokens in the train set, computed once and saved
+to `cache_dir/vocab_mapping/<key>.pt`.
+
+**The default SpecForge pipeline auto-generates this from whatever
+training set the current run is processing.** For our 2-stage training
+this is a silent correctness bug:
+
+* Stage 1 trains the lm_head aligned to a mapping derived from
+  `cascade2_sft_train.jsonl` only.
+* Stage 2 starts from the stage 1 checkpoint via `--ckpt-dir` -- and
+  the standard pipeline calls `draft_model.load_vocab_mapping(...)`
+  AFTER loading the checkpoint, which **overwrites** the d2t/t2d
+  buffers with a NEW mapping derived from `c2_traces_train.jsonl`.
+* Result: the lm_head loaded from stage 1 was trained so that index
+  `i` predicts `stage1_d2t[i]`, but in stage 2 forward, index `i`
+  is interpreted as `stage2_d2t[i]` -- a different target token.
+  Training won't crash, won't blow up, will just slowly converge to
+  a worse minimum.
+
+**Fix** (already in this branch): build a UNION vocab mapping from
+the combined token frequencies of stage 1 + stage 2, save it to
+`$WORK_DIR/data/union_vocab_mapping_l32k.pt`, and pass it to BOTH
+stage launchers via the new `--vocab-mapping-path` CLI flag. Both
+stages then share identical d2t/t2d buffers.
+
+```bash
+# Build the union mapping (one-time, ~1 min, requires both stage
+# data files prepped + their caches built):
+python experiments/nemotron-cascade-2/build_union_vocab_mapping.py \
+    --target-model-path nvidia/Nemotron-Cascade-2-30B-A3B \
+    --draft-model-config configs/nemotron-cascade-2-eagle3-sw4k.json \
+    --stage1-data-path $WORK_DIR/data/all_data_stage1.jsonl \
+    --stage2-data-path $WORK_DIR/data/all_data_stage2.jsonl \
+    --max-length 32768 \
+    --chat-template nemotron-h \
+    --cache-dir $WORK_DIR/cache_l32768 \
+    --output-path $WORK_DIR/data/union_vocab_mapping_l32k.pt \
+    --num-proc 32 \
+    --trust-remote-code
+```
+
+The first build of this iteration showed:
+* stage 1 alone: 81,439 unique loss-masked tokens
+* stage 1 + stage 2 union: 83,209 (stage 2 contributed 1,770 NEW tokens
+  not present in stage 1's loss-masked positions -- mostly latex /
+  reasoning markers)
+* top-32000 union covers 99.77% of all tokens by frequency
+
+Both stage launchers default `VOCAB_MAPPING_PATH` to
+`$WORK_DIR/data/union_vocab_mapping_l32k.pt`. If you change the
+training data and need to rebuild, delete the .pt file first
+(the union builder refuses to overwrite an existing file).
+
 ### Recommended next-agent runbook (current iteration)
 
 ```bash
 cd $SPECFORGE_ROOT
 export WORK_DIR=$(pwd)/eagle3-work   # or your scratch dir
 
-# Stage 1
+# Stage 1 prep (also stages c2_traces_validation.jsonl into $WORK_DIR/data/)
 bash experiments/nemotron-cascade-2/prepare_data_stage1.sh
-TRAIN_DATA=$WORK_DIR/data/all_data_stage1.jsonl \
+
+# Stage 2 prep (must run BEFORE the union vocab builder so it has
+# both data files to scan)
+bash experiments/nemotron-cascade-2/prepare_data_stage2.sh
+
+# Build BOTH caches (needed by the union vocab builder for cache hits)
+CACHE_DIR=$WORK_DIR/cache_l32768 MAX_LENGTH=32768 EXPERIMENT=sw4k \
+    TRAIN_DATA=$WORK_DIR/data/all_data_stage1.jsonl \
     bash experiments/nemotron-cascade-2/build_cache.sh
+CACHE_DIR=$WORK_DIR/cache_l32768 MAX_LENGTH=32768 EXPERIMENT=sw4k \
+    TRAIN_DATA=$WORK_DIR/data/all_data_stage2.jsonl \
+    bash experiments/nemotron-cascade-2/build_cache.sh
+
+# Build the UNION vocab mapping (see "vocab mapping" section above)
+python experiments/nemotron-cascade-2/build_union_vocab_mapping.py \
+    --target-model-path nvidia/Nemotron-Cascade-2-30B-A3B \
+    --draft-model-config configs/nemotron-cascade-2-eagle3-sw4k.json \
+    --stage1-data-path $WORK_DIR/data/all_data_stage1.jsonl \
+    --stage2-data-path $WORK_DIR/data/all_data_stage2.jsonl \
+    --max-length 32768 \
+    --chat-template nemotron-h \
+    --cache-dir $WORK_DIR/cache_l32768 \
+    --output-path $WORK_DIR/data/union_vocab_mapping_l32k.pt \
+    --num-proc 32 \
+    --trust-remote-code
+
+# Stage 1 train (uses union vocab mapping by default)
 bash experiments/nemotron-cascade-2/run_train_stage1.sh \
     2>&1 | tee /workspace/eagle3_training/logs/train_stage1.log
 
 # After stage 1 finishes, find the deepest checkpoint:
 ls $WORK_DIR/checkpoints/nemotron-cascade-2-eagle3-stage1/
 
-# Stage 2 (loads stage1 weights, fresh optimizer)
-bash experiments/nemotron-cascade-2/prepare_data_stage2.sh
-TRAIN_DATA=$WORK_DIR/data/all_data_stage2.jsonl \
-    bash experiments/nemotron-cascade-2/build_cache.sh
+# Stage 2 train (loads stage1 weights via --ckpt-dir, fresh optimizer,
+# SAME union vocab mapping by default)
 CKPT_DIR=$WORK_DIR/checkpoints/nemotron-cascade-2-eagle3-stage1/epoch_0_step_<N> \
     bash experiments/nemotron-cascade-2/run_train_stage2.sh \
     2>&1 | tee /workspace/eagle3_training/logs/train_stage2.log

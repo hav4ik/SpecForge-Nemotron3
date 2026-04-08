@@ -160,6 +160,25 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     )
     dataset_group.add_argument("--build-dataset-num-proc", type=int, default=8)
     dataset_group.add_argument(
+        "--vocab-mapping-path",
+        type=str,
+        default=None,
+        help=(
+            "Override the auto-generated draft vocab mapping (d2t / t2d) "
+            "with a pre-built file. When set, the train script SKIPS "
+            "regenerating the mapping from the train set's loss-masked "
+            "token frequencies and instead loads the d2t / t2d tensors "
+            "from this path. Required for multi-stage training where the "
+            "stage 1 lm_head must remain aligned with the stage 2 vocab "
+            "indices -- otherwise stage 2 silently overwrites the buffers "
+            "with a stage-2-derived mapping that does NOT match the "
+            "stage 1 lm_head's index semantics. Build the union mapping "
+            "via experiments/nemotron-cascade-2/build_union_vocab_mapping.py "
+            "and pass the resulting .pt file via this flag on BOTH stage "
+            "launchers."
+        ),
+    )
+    dataset_group.add_argument(
         "--dataloader-num-workers",
         type=int,
         default=4,
@@ -595,13 +614,29 @@ def build_dataloaders(
             num_proc=args.build_dataset_num_proc,
             train_only_last_turn=args.train_only_last_turn,
         )
-        vocab_mapping_path = generate_vocab_mapping_file(
-            dataset=train_eagle3_dataset,
-            target_vocab_size=draft_model_config.vocab_size,
-            draft_vocab_size=draft_model_config.draft_vocab_size,
-            cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
-            cache_key=cache_key,
-        )
+        if args.vocab_mapping_path is not None:
+            # Caller provided a pre-built (e.g. union) vocab mapping.
+            # Skip regeneration entirely so we don't accidentally
+            # overwrite stage-1-aligned d2t/t2d buffers with stage-2-
+            # derived ones during multi-stage training.
+            if not os.path.isfile(args.vocab_mapping_path):
+                raise FileNotFoundError(
+                    f"--vocab-mapping-path={args.vocab_mapping_path} "
+                    f"does not exist"
+                )
+            vocab_mapping_path = args.vocab_mapping_path
+            print_on_rank0(
+                f"[vocab-mapping] using pre-built mapping from "
+                f"{vocab_mapping_path} (skipping auto-generation)"
+            )
+        else:
+            vocab_mapping_path = generate_vocab_mapping_file(
+                dataset=train_eagle3_dataset,
+                target_vocab_size=draft_model_config.vocab_size,
+                draft_vocab_size=draft_model_config.draft_vocab_size,
+                cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
+                cache_key=cache_key,
+            )
 
         if not is_online:
             train_eagle3_dataset = build_offline_eagle3_dataset(

@@ -62,6 +62,12 @@ NUM_GPUS=${NUM_GPUS:-2}
 NUM_EPOCHS=${NUM_EPOCHS:-1}
 MAX_LENGTH=${MAX_LENGTH:-32768}
 CACHE_DIR=${CACHE_DIR:-$WORK_DIR/cache_l${MAX_LENGTH}}
+# CRITICAL: must point at the UNION (stage1+stage2) vocab mapping so the
+# draft lm_head trained in stage 1 stays index-aligned with stage 2's
+# vocab when stage 2 loads from --ckpt-dir. Build it once via:
+#   python experiments/nemotron-cascade-2/build_union_vocab_mapping.py ...
+# See HANDOFF.md "vocab mapping bug" section for the full rationale.
+VOCAB_MAPPING_PATH=${VOCAB_MAPPING_PATH:-$WORK_DIR/data/union_vocab_mapping_l32k.pt}
 
 mkdir -p "$CACHE_DIR" "$WORK_DIR/checkpoints" "$WORK_DIR/logs"
 
@@ -85,6 +91,7 @@ python -m torch.distributed.run \
     --eval-data-path "$EVAL_DATA" \
     --eval-lengths 16384,32768,65536 \
     --eval-interval 1000 \
+    --vocab-mapping-path "$VOCAB_MAPPING_PATH" \
     --with-data-bucketing \
     --chat-template nemotron-h \
     --cache-dir "$CACHE_DIR" \

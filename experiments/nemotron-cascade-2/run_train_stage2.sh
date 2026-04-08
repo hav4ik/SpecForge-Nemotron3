@@ -53,6 +53,11 @@ NUM_EPOCHS=${NUM_EPOCHS:-3}
 LEARNING_RATE=${LEARNING_RATE:-5e-5}
 MAX_LENGTH=${MAX_LENGTH:-32768}
 CACHE_DIR=${CACHE_DIR:-$WORK_DIR/cache_l${MAX_LENGTH}}
+# CRITICAL: must be the SAME union vocab mapping stage 1 was trained
+# with. The lm_head trained in stage 1 is index-aligned to this mapping;
+# overriding it with the auto-generated stage-2-derived mapping would
+# silently corrupt training. See HANDOFF.md.
+VOCAB_MAPPING_PATH=${VOCAB_MAPPING_PATH:-$WORK_DIR/data/union_vocab_mapping_l32k.pt}
 
 if [[ -z "${CKPT_DIR:-}" ]]; then
     echo "ERROR: CKPT_DIR must be set to the stage-1 checkpoint directory." >&2
@@ -96,6 +101,7 @@ python -m torch.distributed.run \
     --eval-data-path "$EVAL_DATA" \
     --eval-lengths 16384,32768,65536 \
     --eval-interval 1000 \
+    --vocab-mapping-path "$VOCAB_MAPPING_PATH" \
     --chat-template nemotron-h \
     --cache-dir "$CACHE_DIR" \
     --output-dir "$WORK_DIR/checkpoints/nemotron-cascade-2-eagle3-stage2" \
