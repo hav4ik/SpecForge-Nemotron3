@@ -93,6 +93,7 @@ python -m torch.distributed.run \
     --save-interval 2000 \
     --log-interval 20 \
     --warmup-ratio 0.02 \
+    --model-card-template "$SCRIPT_DIR/MODEL_CARD_TEMPLATE_sw4k.md" \
     --report-to wandb \
     --wandb-project nemotron-cascade-2-eagle3 \
     --wandb-name sw4k-L65k-ttt6-fused-mixed \

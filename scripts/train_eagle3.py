@@ -203,6 +203,21 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         ),
     )
     training_group.add_argument(
+        "--model-card-template",
+        type=str,
+        default=None,
+        help=(
+            "Path to a Markdown model-card template that will be rendered "
+            "into every saved checkpoint folder as MODEL_CARD.md. "
+            "Placeholders like {ckpt_basename}, {epoch}, {step}, "
+            "{git_commit}, {train_date}, {max_length}, {ttt_length}, "
+            "{lr}, {warmup_ratio}, {num_epochs}, {batch_size}, {dp_size}, "
+            "{global_batch}, {wandb_run_url} will be substituted at save "
+            "time. See experiments/nemotron-cascade-2/MODEL_CARD_TEMPLATE_*.md "
+            "for examples. If unset, no MODEL_CARD.md is written."
+        ),
+    )
+    training_group.add_argument(
         "--draft-mlp-chunk-size",
         type=int,
         default=0,
@@ -611,6 +626,88 @@ def build_dataloaders(
     )
 
 
+def _render_model_card(args: Namespace, ckpt_dir: str, epoch: int, step: int) -> None:
+    """
+    Render the experiment's MODEL_CARD template into the given checkpoint
+    directory as ``MODEL_CARD.md``, substituting the runtime values
+    (max_length, ttt_length, lr, wandb_run_url, git_commit, train_date,
+    etc.) into the template's ``{placeholder}`` slots.
+
+    No-op (with a warning) if the user did not pass --model-card-template
+    or if the template file does not exist. Failures during rendering are
+    logged but never raise -- model card generation should never break a
+    training run.
+    """
+    if not getattr(args, "model_card_template", None):
+        return
+    template_path = args.model_card_template
+    if not os.path.isfile(template_path):
+        print_on_rank0(
+            f"[model-card] WARN: --model-card-template={template_path} does "
+            f"not exist; skipping model card render for {ckpt_dir}"
+        )
+        return
+
+    # Best-effort: gather everything we know about the run.
+    import datetime
+    import subprocess
+
+    def _git_commit() -> str:
+        try:
+            return subprocess.check_output(
+                ["git", "-C", os.path.dirname(os.path.abspath(__file__)),
+                 "rev-parse", "--short=12", "HEAD"],
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+        except Exception:
+            return "unknown"
+
+    def _wandb_url() -> str:
+        try:
+            import wandb
+            run = wandb.run
+            if run is not None:
+                return run.get_url() or "(wandb run not started)"
+        except Exception:
+            pass
+        return "(wandb not initialized)"
+
+    placeholders = {
+        "ckpt_basename": os.path.basename(ckpt_dir),
+        "epoch": str(epoch),
+        "step": str(step),
+        "git_commit": _git_commit(),
+        "train_date": datetime.datetime.utcnow().strftime("%Y-%m-%d UTC"),
+        "max_length": str(args.max_length),
+        "ttt_length": str(args.ttt_length),
+        "lr": f"{args.learning_rate:g}",
+        "warmup_ratio": f"{args.warmup_ratio:g}",
+        "num_epochs": str(args.num_epochs),
+        "batch_size": str(args.batch_size),
+        "dp_size": str(getattr(args, "dp_size", "?")),
+        "global_batch": str(int(args.batch_size) * int(getattr(args, "dp_size", 1))),
+        "wandb_run_url": _wandb_url(),
+    }
+
+    try:
+        with open(template_path, "r") as f:
+            template = f.read()
+        # Use literal `str.replace` per known key rather than `str.format`
+        # so curly braces in any JSON / shell snippets in the template are
+        # left untouched. The placeholders we care about have the pattern
+        # `{key_name}` with lowercase ascii / underscore -- these never
+        # collide with valid JSON since JSON keys are quoted strings.
+        rendered = template
+        for key, value in placeholders.items():
+            rendered = rendered.replace("{" + key + "}", str(value))
+        out_path = os.path.join(ckpt_dir, "MODEL_CARD.md")
+        with open(out_path, "w") as f:
+            f.write(rendered)
+        print_on_rank0(f"[model-card] wrote {out_path}")
+    except Exception as e:
+        print_on_rank0(f"[model-card] WARN: failed to render model card: {e!r}")
+
+
 def save_checkpoints(
     args: Namespace,
     epoch: int,
@@ -650,6 +747,8 @@ def save_checkpoints(
                 state_dict=draft_model_state_dict,
             )
             print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
+            # Render the model card (no-op if --model-card-template not set).
+            _render_model_card(args, epoch_output_dir, epoch, step)
         dist.barrier()
 
 

@@ -60,6 +60,7 @@ python -m torch.distributed.run \
     --save-interval 2000 \
     --log-interval 20 \
     --warmup-ratio 0.02 \
+    --model-card-template "$SCRIPT_DIR/MODEL_CARD_TEMPLATE_baseline.md" \
     --report-to wandb \
     --wandb-project nemotron-cascade-2-eagle3 \
     --wandb-name baseline-L32k-ttt2-mixed \
