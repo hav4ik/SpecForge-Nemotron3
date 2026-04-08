@@ -45,6 +45,24 @@ optimization.
   layer loaded from the verifier).
 * **Checkpoint**: `{ckpt_basename}` (epoch {epoch}, step {step}).
 
+## Training schedule: 2-stage (SFT bootstrap + on-policy specialization)
+
+This draft head is trained in **two stages** to first build a general-language
+foundation and then specialize to the on-policy reasoning trace distribution
+that the verifier will actually emit at inference time.
+
+| Stage | Source | Rows | LR | Epochs | Bucketing | Notes |
+|---|---|---|---|---|---|---|
+| **Stage 1** (SFT bootstrap) | `cascade2_sft_train.jsonl` | 20,000 | 1e-4 | 1 | **on** (length-bucketed sampler, stage 1 only) | Broad SFT distribution; long-tail length variance, so length-bucketed sampling kills the straggler-rank bottleneck on DP=2 |
+| **Stage 2** (on-policy fine-tune) | `c2_traces_train.jsonl` | 9,658 | 5e-5 | 2-3 | **off** | Loaded from stage 1 checkpoint via `--ckpt-dir` (weight-only, fresh optimizer). Bucketing intentionally disabled to maximize gradient diversity per step on the narrower on-policy distribution we're specializing to. |
+
+The CoT trace set (`c2_traces_cot_train.jsonl`, 0.9k rows) is **excluded
+from this iteration** because it has significantly higher mean tokens-per-row
+(~50k) than the plain traces (~21k), which would slow stage 2 wall-clock for
+marginal benefit on the first baseline. It will be folded back in for a
+follow-up stage 2 fine-tune if the deployed draft underperforms on
+CoT-heavy reasoning.
+
 ## Key training details
 
 | | |
@@ -52,39 +70,149 @@ optimization.
 | **Training framework** | SpecForge fork at https://github.com/hav4ik/SpecForge-Nemotron3, branch `nemotron-cascade-2-experiments` |
 | **Git commit** | `{git_commit}` |
 | **Training date** | {train_date} |
-| **Training data** | `chankhavu/c2_eagle3_train` (cascade2 SFT 20k + on-policy traces 9.6k + on-policy CoT 0.9k = 30566 conversations, pre-shuffled) |
-| **Max sequence length** | {max_length} tokens (preserves ~96.5% of conversations fully at 65536) |
+| **Max sequence length** | **{max_length} tokens** (this iteration is the L=32768 fast-iteration baseline; an L=65536 follow-up is planned once this baseline ships -- see "Iteration plan" section below) |
+| **Truncation loss at this max_length** | Stage 1: ~26% of tokens lost to L=32768 truncation (avg tok/row 18904 → 13898). Stage 2: ~15% of tokens lost (avg 21468 → 18179). See "Training data accounting" section below for the per-stage table. |
 | **TTT length** | {ttt_length} (Eagle3 test-time-training unroll depth) |
 | **Sliding window** | 4096 tokens on the draft attention |
 | **Optimizer** | BF16Optimizer, lr={lr}, warmup_ratio={warmup_ratio} |
-| **Epochs** | {num_epochs} |
+| **Epochs (this stage)** | {num_epochs} |
 | **Per-rank batch size** | {batch_size} (no sequence packing) |
 | **Tensor parallel** | TP=1, DP={dp_size} |
 | **Global effective batch per step** | {global_batch} conversations |
 
-### Note on batch size
+## Training data accounting (the full token-count picture)
 
-This draft was trained with **per-rank `batch_size=1`** and **no
-sequence packing**. With `dp_size={dp_size}` data-parallel ranks the
-global effective batch is **{global_batch} conversations per
-optimizer step**. This is the standard configuration for long-context
-Eagle3 training (NVIDIA's gpt-oss-120b long-context Eagle3 uses the
-same per-rank batch=1 layout) -- packing into fixed-token-budget
-batches gives diminishing returns at L=65536 because each
-conversation already saturates the GPU activation budget.
+Three different but equally valid token counts exist for this dataset, and
+they don't agree because they measure different things. Documented here to
+prevent future confusion:
 
-Per-step **token counts vary by ~20x** because conversation lengths
-in the training distribution range from ~30 to ~65000 tokens
-(p25=4k, p50=12k, p75=28k, p95=62k tokens). Random per-rank shuffling
-means per-step wall-clock time has the same variance, and the slowest
-rank determines the global step time. Per-token gradient signal is
-still ample (~`E[seq_len] * ttt_length = 70k+` position gradients per
-rank per step, more than the original Eagle3 paper's batch=16 setup
-on ~1k-token ShareGPT sequences). So the small global batch does NOT
-hurt convergence per gradient step; it only hurts wall-clock
-throughput. A length-bucketed `DistributedSampler` would close most
-of the throughput gap without touching the math (tracked as future
-work in the SpecForge fork's experiments folder).
+| Metric | Stage 1 (cascade2_sft_train) | Stage 2 (c2_traces_train) | Source |
+|---|---|---|---|
+| Rows / conversations | 20,000 | 9,658 | dataset card + jsonl line count |
+| **Untruncated total tokens** (1) | **378,073,468** | **207,336,404** | dataset card (`apply_chat_template(messages, tokenize=True)`) |
+| **Truncated total tokens** at L=32768 (2) | 277,963,707 | 175,570,455 | this fork's tokenizer pipeline w/ `max_length=32768` |
+| Truncation loss vs (1) | 100 M / 26.5% | 32 M / 15.3% | (1) - (2) |
+| **Loss-masked tokens** (assistant turns only, what loss is computed on) (3) | **132,941,808** | **158,793,164** | this fork, `loss_mask == 1` positions in the tokenized sequence |
+| Loss-mask fraction of (2) | 47.8% | 90.4% | (3) / (2) |
+| Avg untruncated tok/row | 18,904 | 21,468 | dataset card |
+| Avg truncated tok/row | 13,898 | 18,179 | (2) / rows |
+| Avg loss-masked tok/row | 6,647 | 16,442 | (3) / rows |
+| jsonl size on disk | 1521 MiB | 660 MiB | filesystem |
+
+The three counts measure:
+
+1. **Untruncated total** -- every token in the conversation including system
+   prompt + user turns + assistant turns + special tokens, with no max-length
+   cap. This is what the dataset card publishes.
+2. **Truncated total** -- same thing but capped at the training `max_length`.
+   Any sample longer than the cap loses its tail. **Stage 1 loses ~26% of
+   total tokens at L=32768** because most SFT conversations are >18k tokens
+   and many exceed 32k. Stage 2 loses ~15%. This is the main reason an L=65536
+   follow-up is planned.
+3. **Loss-masked** -- the subset of (2) where `loss_mask == 1`, i.e. only
+   the assistant-turn positions. These are the only positions Eagle3's
+   distillation loss is computed on. Stage 2's 90% loss-mask fraction
+   reflects that reasoning traces are mostly the model's *output* (short
+   user prompt, very long assistant trace). Stage 1's 48% reflects more
+   balanced SFT dialogue.
+
+## Eagle3 vocabulary pruning (the union d2t / t2d mapping)
+
+Eagle3's draft head predicts logits over a **smaller draft vocabulary**
+than the verifier's full vocab to keep the lm_head shape manageable.
+Concretely: `target_vocab_size=131072` → `draft_vocab_size=32000`. The
+mapping (`d2t` and `t2d` buffers on the draft model) is the **top-32000
+most frequent target tokens** in the training set, computed from
+loss-masked positions.
+
+**Multi-stage gotcha** (fixed in this fork): the standard SpecForge
+pipeline auto-generates the d2t / t2d from whatever training set the
+current run is processing, and unconditionally calls
+`draft_model.load_vocab_mapping(...)` AFTER loading the checkpoint passed
+via `--ckpt-dir`. For 2-stage training this would mean stage 2 OVERWRITES
+the d2t / t2d buffers loaded from the stage 1 checkpoint with a NEW
+mapping derived from stage 2's train set. The lm_head weights loaded from
+stage 1 would still be aligned to stage 1's mapping → silent index
+permutation mismatch in every gradient step of stage 2.
+
+**Fix**: a [union vocab mapping](https://github.com/hav4ik/SpecForge-Nemotron3/blob/nemotron-cascade-2-experiments/experiments/nemotron-cascade-2/build_union_vocab_mapping.py)
+built from the *combined* token frequencies of stage 1 + stage 2,
+saved once before training, and passed to BOTH stage launchers via
+`--vocab-mapping-path`. This way the lm_head is index-aligned end to end.
+
+**Per-stage coverage with the union top-32000:**
+
+| Stage | Total loss-masked tokens | Unique token ids | Coverage by union top-32k | Tokens lost (out of vocab) | Unique-in-vocab |
+|---|---|---|---|---|---|
+| Stage 1 | 132,941,808 | 81,439 | **99.5328%** | 621,131 (0.47%) | 31,978 / 81,439 (39.27%) |
+| Stage 2 | 158,793,164 | 36,510 | **99.9621%** | 60,180 (0.04%) | 26,017 / 36,510 (71.26%) |
+| Union | 291,734,972 | 83,209 | **99.77%** | 671,311 (0.23%) | 32,000 / 83,209 (38.46%) |
+
+Stage 2 has *better* coverage than stage 1 even though the union top-K
+was built jointly -- because stage 2's reasoning-trace distribution is
+much narrower (~half the unique tokens of stage 1 despite ~20% more
+total tokens). Stage 2 contributes 1,770 unique tokens *not* present in
+stage 1's loss-masked positions (mostly latex / reasoning markers); these
+would have been silently dropped from the draft vocab if the mapping had
+been built from stage 1 only.
+
+Both stages comfortably exceed 99% frequency coverage with `draft_vocab_size=32000`,
+so the chosen draft vocab is big enough -- no need to grow it.
+
+## Iteration plan: this is the L=32768 fast-iteration baseline
+
+This checkpoint is the **first** Eagle3 head trained against
+Nemotron-Cascade-2 in this fork's iteration sequence:
+
+| Iteration | max_length | Status | Goal |
+|---|---|---|---|
+| **L=32768** (this) | 32768 | in flight / shipped | Fast-iteration baseline. Get a working draft with all the engineering knobs validated end-to-end. Pays a ~26% truncation loss on stage 1 and ~15% on stage 2. |
+| **L=65536** (next) | 65536 | planned | Long-context follow-up. Re-train both stages at the higher cap to recover the truncated tail. Will need `--draft-mlp-grad-checkpoint` re-enabled to fit on a 96 GB GPU per rank. |
+
+The per-length eval data (16k / 32k / 64k validation sets, see below)
+lets us measure how well the L=32k draft generalizes to longer contexts
+*without* training at long context. If the L=32k → L=64k generalization
+gap on the eval set is small, the L=65k follow-up may not be worth
+re-training. If the gap is large, the follow-up is justified.
+
+### Note on batch size + length-bucketed sampling
+
+This draft is trained with **per-rank `batch_size=1`** and **no sequence
+packing**. With `dp_size={dp_size}` data-parallel ranks the global
+effective batch is **{global_batch} conversations per optimizer step**.
+This is the standard configuration for long-context Eagle3 training
+(NVIDIA's gpt-oss-120b long-context Eagle3 uses the same per-rank
+batch=1 layout) -- packing into fixed-token-budget batches gives
+diminishing returns at long context because each conversation already
+saturates the GPU activation budget.
+
+Per-step token counts vary by **~20x** because conversation lengths
+in the training distribution range from ~30 to ~30000+ tokens. Without
+length-aware sampling, every optimizer step is bottlenecked by the
+slowest rank: a (2k, 32k) DP-pair wastes half the GPU while rank 1
+sits idle waiting for rank 0.
+
+**Stage 1 fixes this with length-bucketed sampling**
+(`--with-data-bucketing`, see
+[`specforge/data/utils.py:LengthBucketDistributedSampler`](https://github.com/hav4ik/SpecForge-Nemotron3/blob/nemotron-cascade-2-experiments/specforge/data/utils.py)):
+the sampler sorts the dataset by per-sample length, partitions the
+sorted index into contiguous "global batches" of size `num_replicas *
+batch_size`, shuffles only the *order* of those global batches per
+epoch with a deterministic seed, and assigns each rank its slice of
+every global batch. Effect: all ranks within a single optimizer step
+see samples of similar length, eliminating the straggler-rank waste.
+
+**Bias mitigation**: pure length-sorted iteration would bias gradient
+updates by difficulty across an epoch (long samples first or last). The
+per-epoch global-batch-order shuffle mitigates this; the intra-batch
+order is intentionally NOT shuffled so each step still sees bucketed
+lengths. Same tradeoff as HF Trainer's `group_by_length=True`.
+
+**Stage 2 leaves bucketing OFF** intentionally. The on-policy reasoning
+trace distribution is narrow enough that gradient diversity per step
+matters more than throughput, and the per-step difficulty drift would
+work against the "specialize precisely" goal of stage 2.
+
 | **Wandb run** | {wandb_run_url} |
 
 ## ⚠️ CRITICAL: Mamba SSM state precision
@@ -190,34 +318,46 @@ This checkpoint is the first published Eagle3 head built around this
 hypothesis. Acceptance rates / downstream speedup numbers (when
 available) will be added to a follow-up section here.
 
-## Memory engineering required to train at L=65536
+## Memory engineering required to train at long context
 
 Training a 1-layer Llama-style draft against a 30B-param frozen
-Mamba-Transformer verifier at L=65536 with `ttt_length=6` does not fit
-on a 96 GB GPU per rank without significant engineering. The
-SpecForge fork that produced this checkpoint adds the following
-training-time optimizations (all required for this configuration):
+Mamba-Transformer verifier at long context (L=32k or L=65k) with
+`ttt_length=6` does not fit on a 96 GB GPU per rank without
+significant engineering. The SpecForge fork that produced this
+checkpoint adds the following training-time optimizations:
 
-1. **Grad-checkpoint on the draft MLP** (`--draft-mlp-grad-checkpoint`):
-   recomputes `gate_proj/silu/up_proj/(gate*up)` intermediates during
-   backward, drops them from the saved-for-backward set across TTT
-   unrolls.
-2. **Chunked MLP forward** (`--draft-mlp-chunk-size 4096`): Liger-style
-   per-chunk MLP forward over the seq dim, drops the per-step
-   transient peak from ~4 GiB to ~800 MiB per MLP forward.
-3. **Chunked fused linear + soft-target CE**
-   (`--fused-linear-loss --fused-linear-loss-chunk-size 4096`): chunks
-   the lm_head + KL-distillation loss over the seq dim with per-chunk
-   grad checkpointing, never materializes the full `[B, T, V]` logits
-   tensor. Mathematically equivalent to the unchunked path (numerical
-   equivalence verified in the SpecForge fork's
-   `specforge/core/loss.py` `__main__` block).
-4. **Sliding-window attention** on the draft (this checkpoint's config).
+1. **Chunked MLP forward** (`--draft-mlp-chunk-size 4096`,
+   **active for this checkpoint**): Liger-style per-chunk MLP forward
+   over the seq dim, drops the per-step transient peak from ~4 GiB to
+   ~800 MiB per MLP forward. Cheap defensive memory saving with
+   negligible compute overhead.
+2. **Chunked fused linear + soft-target CE**
+   (`--fused-linear-loss --fused-linear-loss-chunk-size 4096`,
+   **active for this checkpoint**): chunks the lm_head + KL-distillation
+   loss over the seq dim with per-chunk grad checkpointing, never
+   materializes the full `[B, T, V]` logits tensor. Saves ~14 GiB at
+   L=32k and ~28 GiB at L=65k. Mathematically equivalent to the
+   unchunked path (numerical equivalence verified in the SpecForge
+   fork's `specforge/core/loss.py` `__main__` block).
+3. **Sliding-window attention** on the draft (`sliding_window=4096`,
+   **active for this checkpoint**): collapses draft self-attention
+   from O(L²) to O(L * window). See "Sliding-window attention" section.
+4. **Mamba SSM fp32 monkey-patch** (always on): see Mamba SSM section.
 5. **Patch to free verifier full-vocab logits** before draft TTT
    unrolling so the ~16 GiB `[L, V]` tensor doesn't stay alive across
    the backward pass.
 6. **In-place padding** for the per-step shift operations on big
    logit tensors.
+
+**Disabled at L=32k, re-enabled at L=65k**:
+
+7. **Grad-checkpoint on the draft MLP** (`--draft-mlp-grad-checkpoint`,
+   **OFF for this L=32k checkpoint**, will be ON for the L=65k follow-up):
+   recomputes `gate_proj/silu/up_proj/(gate*up)` intermediates during
+   backward, drops them from the saved-for-backward set across TTT
+   unrolls. Required at L=65k to fit on 96 GB but costs ~25-30% on the
+   draft forward, so we leave it off at L=32k where we have memory
+   headroom and want maximum step throughput.
 
 See the
 [experiments/nemotron-cascade-2/README.md](https://github.com/hav4ik/SpecForge-Nemotron3/blob/nemotron-cascade-2-experiments/experiments/nemotron-cascade-2/README.md)
