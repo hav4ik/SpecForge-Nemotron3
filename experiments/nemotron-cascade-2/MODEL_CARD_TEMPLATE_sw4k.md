@@ -29,8 +29,8 @@ optimization.
 ## TL;DR
 
 * **Verifier**: `nvidia/Nemotron-Cascade-2-30B-A3B` (30B-param hybrid
-  Mamba-Transformer MoE, 52 layers = 31 Mamba + 15 MoE/MLP + 6 GQA
-  attention).
+  Mamba-Transformer MoE, **52 layers = 23 Mamba + 23 MLP/MoE + 6 GQA
+  attention**, per the verifier's `hybrid_override_pattern` config).
 * **Draft architecture**: 1-layer Llama transformer block with
   `hidden_size=2688` (matches verifier residual stream),
   `intermediate_size=8064` (~3x hidden), `head_dim=128`,
@@ -39,8 +39,106 @@ optimization.
   (matches verifier so vLLM does not clamp serving max_model_len),
   `vocab_size=131072`, `draft_vocab_size=32000`.
 * **Aux hidden state layers** captured from verifier: layers
-  **2 / 26 / 48** (~4% / 50% / 92% depth -- Mamba / Attention / Mamba).
+  **2 / 26 / 48** (~4% / 51% / 94% depth). See "Layer indexing" section
+  below for the exact mapping and the engine-portability caveat.
   Layout follows NVIDIA's gpt-oss-120b long-context Eagle3 reference.
+
+## Layer indexing -- which verifier layers feed the Eagle3 draft
+
+Eagle3 draft heads consume hidden states from THREE specific layers
+of the verifier (early / middle / late) and learn to map them into
+the draft's prediction. The choice of which 3 layers matters: too
+early and the draft has no semantics; too late and it's just
+predicting from the verifier's own next-token distribution.
+
+This draft is trained against verifier layers **2 / 26 / 48** out of
+the verifier's 52 hybrid layers. **The indexing convention is
+critical and engine-dependent.**
+
+### Verifier layer pattern (canonical, from HF `config.json`)
+
+NemotronH publishes its hybrid layer arrangement as
+`hybrid_override_pattern` in the verifier's `config.json`. For
+`nvidia/Nemotron-Cascade-2-30B-A3B`:
+
+```
+hybrid_override_pattern = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+```
+
+where each character corresponds to one transformer block in the
+52-layer stack (0-indexed):
+* `M` = Mamba (state-space) layer
+* `E` = MLP / MoE feed-forward layer
+* `*` = GQA attention layer
+
+Counts: 23 M + 23 E + 6 * = 52.
+
+### What layers 2 / 26 / 48 actually are
+
+Index counting **all 52 transformer blocks** starting from 0
+(matches HF `transformers` `model.backbone.layers[i]` ordering):
+
+| Index | Char | Type | Depth | Notes |
+|---|---|---|---|---|
+| **2** | `M` | **Mamba** | ~4% | Early Mamba (3rd block overall, 2nd Mamba block) |
+| **26** | `*` | **Attention** | ~51% | Middle attention -- the 4th of 6 attention layers, central position |
+| **48** | `M` | **Mamba** | ~94% | Late Mamba (3rd-from-last block) |
+
+The 6 attention layers are at canonical indices `[5, 12, 19, 26, 33, 42]`.
+Layer 26 is the central one.
+
+### Engine-portability warning
+
+**Different inference engines may number layers differently** because
+of how they fuse, group, or skip blocks. Before serving this draft on
+a new engine, verify that the engine's "layer i" corresponds to the
+same character in the hybrid pattern as HF transformers does.
+
+* **vLLM** (0.19+): uses the full 52-layer ModuleList in its
+  NemotronH model implementation, 0-indexed contiguous, **matches HF
+  transformers**. The `target_hidden_state_indices: [2, 26, 48]` in
+  this draft's `config.json` is read directly by vLLM's Eagle3
+  speculative decoder and passed to the verifier as raw indices into
+  `model.backbone.layers`. **Tested working on vLLM 0.19** with the
+  in-flight L=32k iteration.
+
+* **SGLang**: SGLang's NemotronH implementation also uses 0-indexed
+  contiguous layer counting that matches HF, but as of late 2025 it
+  does NOT yet support sliding-window attention on Eagle3 drafts
+  (this draft has `sliding_window: 4096` in its config). Once SGLang
+  ships sw support, the layer indices should map cleanly. **Until
+  then, prefer vLLM for serving this draft.**
+
+* **HF transformers** (raw, no engine): the verifier exposes its
+  layers as `model.backbone.layers[0..51]`, where `layers[i]` is the
+  i-th character of `hybrid_override_pattern`. This is the canonical
+  reference. The training pipeline in this fork (SpecForge with the
+  NemotronH backend patch) reads from these indices via the
+  `aux_hidden_state_layers` config field on the draft.
+
+* **TensorRT-LLM / others**: NOT tested. If you port to one of these,
+  cross-check by running a single forward pass on a fixed input and
+  comparing the hidden state dump at indices 2/26/48 against vLLM's
+  dump for the same input. The hidden states should be bit-equivalent
+  (or near-equivalent up to dtype) at the same indices if the
+  numbering convention matches.
+
+### Why these specific indices
+
+These three positions follow NVIDIA's gpt-oss-120b long-context Eagle3
+recipe (early/mid/late triad). The choice of 2 / 26 / 48 as opposed to
+e.g. 0 / 26 / 51 was made to:
+* **Avoid layer 0** (the embedding-adjacent layer), where hidden
+  states are still mostly raw token embeddings without much
+  contextualization.
+* **Skip the very last layer** (51), where hidden states are
+  essentially the verifier's own pre-lm_head representation -- the
+  draft would learn a near-identity from there to the verifier's
+  output and not generalize.
+* **Pick a Mamba+Attention+Mamba triad** rather than three of the
+  same type, so the draft sees a mix of state-space (long-range,
+  Mamba) and attention (short-range, GQA) representations of the
+  same input.
 * **Trainable parameters**: ~196 M (excludes the frozen embedding
   layer loaded from the verifier).
 * **Checkpoint**: `{ckpt_basename}` (epoch {epoch}, step {step}).
