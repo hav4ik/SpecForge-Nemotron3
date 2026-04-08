@@ -114,6 +114,38 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     dataset_group.add_argument("--train-hidden-states-path", type=str, default=None)
     dataset_group.add_argument("--eval-hidden-states-path", type=str, default=None)
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
+    dataset_group.add_argument(
+        "--eval-lengths",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated list of max_length caps to evaluate at "
+            "(e.g. '16384,32768,65536'). When set together with "
+            "--eval-data-path, the eval dataset is built once per length "
+            "and N independent eval dataloaders are run each --eval-interval. "
+            "Per-length metrics are logged under eval_l{N}/* keys "
+            "(e.g. eval_l16384/acc_0). If unset, eval uses the single "
+            "--max-length value for both train and eval."
+        ),
+    )
+    dataset_group.add_argument(
+        "--with-data-bucketing",
+        action="store_true",
+        help=(
+            "Enable length-bucketed sampling for the TRAIN dataloader. "
+            "Sorts samples by length and groups them into per-step "
+            "global batches of similar length, eliminating the "
+            "straggler-rank bottleneck where the longest sample in a "
+            "DP step pads out the wall-clock time. The order of global "
+            "batches is shuffled per epoch with a deterministic seed; "
+            "intra-batch order is preserved so each step still sees "
+            "bucketed lengths. Recommended for stage-1 SFT (broad "
+            "length distribution); NOT recommended for stage-2 on-policy "
+            "fine-tune where you want maximum gradient diversity per "
+            "step. See LengthBucketDistributedSampler in "
+            "specforge/data/utils.py for the bias mitigation rationale."
+        ),
+    )
     dataset_group.add_argument("--chat-template", type=str, default="llama3")
     dataset_group.add_argument(
         "--is-preformatted",
@@ -517,7 +549,18 @@ def build_dataloaders(
     args: Namespace,
     draft_model_config: AutoDraftModelConfig,
     processor: Optional[AutoProcessor] = None,
-) -> Tuple[DataLoader, str, Optional[DataLoader]]:
+) -> Tuple[DataLoader, str, List[Tuple[int, DataLoader]]]:
+    """
+    Returns:
+        (train_dataloader, vocab_mapping_path, eval_dataloaders)
+
+        eval_dataloaders is a list of ``(max_length, DataLoader)`` pairs.
+        Empty list when no eval source was provided. When --eval-lengths
+        is set, this contains one entry per requested length, each built
+        from the same source dataset capped at that max_length. When
+        --eval-lengths is unset (legacy single-length eval), this
+        contains exactly one entry at args.max_length.
+    """
     # build dataloaders
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_model_path, trust_remote_code=args.trust_remote_code
@@ -568,6 +611,32 @@ def build_dataloaders(
                 use_usp_preprocess=(args.attention_backend == "usp"),
             )
 
+    # If --with-data-bucketing was set, scan the train dataset once to
+    # gather per-sample lengths. We use the truncated `input_ids` length
+    # (i.e. min(actual, max_length)) so the bucketing matches the actual
+    # per-step compute cost. The scan is O(N) and runs once at startup.
+    train_lengths = None
+    if args.with_data_bucketing:
+        if args.is_vlm:
+            raise ValueError(
+                "--with-data-bucketing is not supported for VLM training "
+                "(per-sample length is not the right cost proxy for VLM)"
+            )
+        print_on_rank0(
+            "[bucketing] computing per-sample lengths for length-bucketed "
+            f"sampling over {len(train_eagle3_dataset)} train samples..."
+        )
+        # `input_ids` is stored as a list[int] per row in the cached
+        # dataset; len() is O(1) per row.
+        train_lengths = [
+            len(ids) for ids in train_eagle3_dataset["input_ids"]
+        ]
+        if len(train_lengths) > 0:
+            print_on_rank0(
+                f"[bucketing] length stats: min={min(train_lengths)} "
+                f"max={max(train_lengths)} mean={sum(train_lengths)/len(train_lengths):.0f}"
+            )
+
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
         args.target_batch_size,
@@ -579,50 +648,90 @@ def build_dataloaders(
             else get_dp_group()
         ),
         is_vlm=args.is_vlm,
+        length_bucket_sample_lengths=train_lengths,
+        length_bucket_seed=args.seed if args.seed else 42,
     )
+
+    eval_dataloaders: List[Tuple[int, DataLoader]] = []
     if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
+        # Determine the list of max_length caps to evaluate at.
+        if args.eval_lengths is not None:
+            try:
+                eval_length_list = [
+                    int(x.strip()) for x in args.eval_lengths.split(",") if x.strip()
+                ]
+            except ValueError as e:
+                raise ValueError(
+                    f"--eval-lengths must be comma-separated integers, "
+                    f"got: {args.eval_lengths!r}"
+                ) from e
+            if not eval_length_list:
+                raise ValueError("--eval-lengths is empty after parsing")
+        else:
+            eval_length_list = [args.max_length]
+
+        # Eval source: load the raw conversations once (for online mode),
+        # then build a separate cached eagle3 dataset per length cap.
+        eval_raw_dataset = None
         if args.eval_data_path is not None:
-            eval_dataset = Dataset.from_generator(
+            eval_raw_dataset = Dataset.from_generator(
                 generator=safe_conversations_generator,
                 gen_kwargs={"file_path": args.eval_data_path},
             )
-            eval_eagle3_dataset = build_eagle3_dataset(
-                eval_dataset,
-                tokenizer,
-                args.chat_template,
-                args.max_length,
+
+        for eval_max_length in eval_length_list:
+            if args.eval_data_path is not None:
+                eval_cache_params = (
+                    f"{args.eval_data_path}-"
+                    f"{eval_max_length}-"
+                    f"{args.chat_template}-"
+                    f"{args.target_model_path}"
+                )
+                eval_cache_key = hashlib.md5(
+                    eval_cache_params.encode()
+                ).hexdigest()
+                with rank_0_priority():
+                    eval_eagle3_dataset = build_eagle3_dataset(
+                        eval_raw_dataset,
+                        tokenizer,
+                        args.chat_template,
+                        eval_max_length,
+                        cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
+                        cache_key=eval_cache_key,
+                        is_vlm=args.is_vlm,
+                        processor=processor,
+                        num_proc=args.build_dataset_num_proc,
+                        is_preformatted=args.is_preformatted,
+                        train_only_last_turn=args.train_only_last_turn,
+                    )
+            else:
+                eval_eagle3_dataset = build_offline_eagle3_dataset(
+                    args.eval_hidden_states_path,
+                    eval_max_length,
+                    ttt_length=args.ttt_length,
+                    use_usp_preprocess=(args.attention_backend == "usp"),
+                )
+            eval_dl = prepare_dp_dataloaders(
+                eval_eagle3_dataset,
+                args.target_batch_size,
+                num_workers=args.dataloader_num_workers,
+                shuffle=False,
+                process_group=(
+                    get_draft_dp_group()
+                    if args.attention_backend == "usp" and not is_online
+                    else get_dp_group()
+                ),
                 is_vlm=args.is_vlm,
-                processor=processor,
-                num_proc=args.build_dataset_num_proc,
-                is_preformatted=args.is_preformatted,
-                train_only_last_turn=args.train_only_last_turn,
             )
-        elif args.eval_hidden_states_path is not None:
-            eval_eagle3_dataset = build_offline_eagle3_dataset(
-                args.eval_hidden_states_path,
-                args.max_length,
-                ttt_length=args.ttt_length,
-                use_usp_preprocess=(args.attention_backend == "usp"),
+            eval_dataloaders.append((eval_max_length, eval_dl))
+            print_with_rank(
+                f"Initialized eval dataloader at max_length={eval_max_length} "
+                f"({len(eval_eagle3_dataset)} samples)"
             )
-        eval_dataloader = prepare_dp_dataloaders(
-            eval_eagle3_dataset,
-            args.target_batch_size,
-            num_workers=args.dataloader_num_workers,
-            shuffle=False,
-            process_group=(
-                get_draft_dp_group()
-                if args.attention_backend == "usp" and not is_online
-                else get_dp_group()
-            ),
-            is_vlm=args.is_vlm,
-        )
-        print_with_rank("Initialized eval dataloader")
-    else:
-        eval_dataloader = None
     return (
         train_dataloader,
         vocab_mapping_path,
-        eval_dataloader,
+        eval_dataloaders,
     )
 
 
@@ -966,7 +1075,7 @@ def main():
     # ================================================
     # 3. Build dataloader
     # ================================================
-    train_dataloader, vocab_mapping_path, eval_dataloader = build_dataloaders(
+    train_dataloader, vocab_mapping_path, eval_dataloaders = build_dataloaders(
         args, draft_model_config, processor
     )
 
@@ -1162,44 +1271,56 @@ def main():
             # ================================================
             # 7.2 Evaluation Step
             # ================================================
-            should_evaluate = (
-                args.eval_data_path is not None
-                or args.eval_hidden_states_path is not None
-            )
+            should_evaluate = len(eval_dataloaders) > 0
             if (
                 should_evaluate
                 and global_step % (args.eval_interval * args.draft_accumulation_steps)
                 == 0
             ):
-                # Run evaluation
+                # Run evaluation. When --eval-lengths is set, we have one
+                # dataloader per length cap and log per-length metrics
+                # under eval_l{N}/* keys (e.g. eval_l16384/acc_0). When
+                # only one length is configured, log under plain eval/*.
                 draft_model.eval()
-                eval_acces = [[] for _ in range(eagle3_model.length)]
-                eval_plosses = [[] for _ in range(eagle3_model.length)]
+                multi_length = len(eval_dataloaders) > 1
+                for eval_max_length, eval_dataloader in eval_dataloaders:
+                    eval_acces = [[] for _ in range(eagle3_model.length)]
+                    eval_plosses = [[] for _ in range(eagle3_model.length)]
+                    for data in tqdm(
+                        eval_dataloader,
+                        desc=(
+                            f"Evaluating Epoch {epoch} "
+                            f"(L={eval_max_length})"
+                        ),
+                    ):
+                        with torch.no_grad():
+                            plosses, acces = run_forward(
+                                args, eagle3_model, data, target_model, is_online
+                            )
+                            eval_acces = [
+                                eval_acces[i] + [acces[i]]
+                                for i in range(len(acces))
+                            ]
+                            eval_plosses = [
+                                eval_plosses[i] + [plosses[i]]
+                                for i in range(len(plosses))
+                            ]
 
-                for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
-                    with torch.no_grad():
-                        plosses, acces = run_forward(
-                            args, eagle3_model, data, target_model, is_online
-                        )
-                        eval_acces = [
-                            eval_acces[i] + [acces[i]] for i in range(len(acces))
-                        ]
-                        eval_plosses = [
-                            eval_plosses[i] + [plosses[i]] for i in range(len(plosses))
-                        ]
+                    # compute average over all minibatches
+                    eval_acces = [torch.stack(acc).mean() for acc in eval_acces]
+                    eval_plosses = [torch.stack(pl).mean() for pl in eval_plosses]
 
-                # compute average over all minibatches
-                eval_acces = [torch.stack(acc).mean() for acc in eval_acces]
-                eval_plosses = [torch.stack(pl).mean() for pl in eval_plosses]
-
-                record_metrcs(
-                    args,
-                    eval_acces,
-                    eval_plosses,
-                    global_step // args.draft_accumulation_steps,
-                    tracker,
-                    mode="eval",
-                )
+                    eval_mode = (
+                        f"eval_l{eval_max_length}" if multi_length else "eval"
+                    )
+                    record_metrcs(
+                        args,
+                        eval_acces,
+                        eval_plosses,
+                        global_step // args.draft_accumulation_steps,
+                        tracker,
+                        mode=eval_mode,
+                    )
             # ================================================
             # 7.3 Save Checkpoints
             # ================================================

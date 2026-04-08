@@ -23,10 +23,129 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, Sampler
 
 from datasets import Dataset
 from specforge.distributed import get_draft_sp_group, get_sp_ulysses_group
+
+
+class LengthBucketDistributedSampler(Sampler[int]):
+    """
+    Length-bucketed distributed sampler for DP training.
+
+    Sorts the dataset by per-sample length, partitions the sorted index
+    into contiguous "global batches" of size ``num_replicas * batch_size``,
+    shuffles the *order* of those global batches per epoch (with a
+    deterministic seed), and assigns each rank its slice of every global
+    batch.
+
+    Why bucket across ranks (not just within rank):
+        With DP=N, each optimizer step is bottlenecked by the slowest
+        rank. If rank 0 happens to draw a 32k-token sample while rank 1
+        draws a 2k-token sample, rank 1 sits idle waiting for rank 0,
+        and the step costs as much as the longest sample. Bucketing
+        across ranks guarantees that all ranks within a single global
+        step see samples of similar length, eliminating the straggler.
+
+    Bias mitigation:
+        Pure length-sorted iteration biases gradient updates by
+        difficulty over an epoch (long samples first or last). To
+        mitigate, the *order of global batches* is shuffled per epoch
+        with a deterministic seed; the *intra-batch* order (which
+        determines the per-step length) is intentionally NOT shuffled,
+        so each step still sees bucketed lengths. This is the same
+        tradeoff used by HF Trainer's ``group_by_length=True`` and
+        fairseq's ``--required-batch-size-multiple`` length grouping.
+
+        For training data with a hard floor on min length (e.g. >= 1024
+        tokens), the worst-case length ratio within a global batch is
+        bounded enough that the gradient bias is negligible compared to
+        the throughput win. For data with extreme min/max ratios
+        (e.g. min=10 tokens, max=65k tokens), bucketing is *not*
+        recommended -- the per-step difficulty drift becomes too large.
+
+    When NOT to use bucketing:
+        * On-policy fine-tune (stage 2) where the data distribution is
+          already narrow and you want maximum gradient diversity per
+          step. Bucketing forces consecutive optimizer steps to see
+          similar lengths, which is the opposite of what you want when
+          you're trying to specialize precisely to that distribution.
+        * Tiny datasets where dropping the trailing partial batch (which
+          ``drop_last=True`` always does) loses meaningful samples.
+
+    Args:
+        lengths: Per-sample length array; ``len(lengths) == len(dataset)``.
+                 Used only for sorting, not stored beyond ``__init__``.
+        num_replicas: DP world size.
+        rank: This process's DP rank.
+        batch_size: Per-rank batch size (the ``DataLoader``'s
+                    ``batch_size`` parameter, NOT global batch).
+        seed: Base RNG seed; epoch is added to it for the per-epoch
+              shuffle of global-batch order.
+        drop_last: Always True in practice; the trailing partial global
+                   batch is dropped to keep ranks balanced.
+    """
+
+    def __init__(
+        self,
+        lengths: List[int],
+        num_replicas: int,
+        rank: int,
+        batch_size: int,
+        seed: int = 42,
+        drop_last: bool = True,
+    ) -> None:
+        if not drop_last:
+            # Supporting drop_last=False would require padding the final
+            # global batch with re-sampled indices to keep ranks balanced;
+            # we have no use case for it and it just adds bugs.
+            raise ValueError("LengthBucketDistributedSampler requires drop_last=True")
+        if num_replicas <= 0 or rank < 0 or rank >= num_replicas:
+            raise ValueError(
+                f"invalid num_replicas={num_replicas} / rank={rank}"
+            )
+        if batch_size <= 0:
+            raise ValueError(f"invalid batch_size={batch_size}")
+
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.batch_size = batch_size
+        self.seed = seed
+        self.epoch = 0
+
+        # Sort the dataset indices by length (stable on ties).
+        self._sorted_indices = sorted(
+            range(len(lengths)), key=lambda i: lengths[i]
+        )
+        # Drop the trailing partial global batch.
+        global_batch = num_replicas * batch_size
+        self._n_global_batches = len(self._sorted_indices) // global_batch
+        self._sorted_indices = self._sorted_indices[
+            : self._n_global_batches * global_batch
+        ]
+        # Per-rank epoch length (DataLoader will see this many indices).
+        self._per_rank_len = self._n_global_batches * batch_size
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return self._per_rank_len
+
+    def __iter__(self):
+        gb = self.num_replicas * self.batch_size
+        # Shuffle the ORDER of global batches deterministically per
+        # epoch. Intra-batch order is preserved so length-bucketing
+        # holds within each step.
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        order = torch.randperm(self._n_global_batches, generator=g).tolist()
+        for batch_idx in order:
+            start = batch_idx * gb
+            rank_start = start + self.rank * self.batch_size
+            rank_end = rank_start + self.batch_size
+            for idx in self._sorted_indices[rank_start:rank_end]:
+                yield idx
 
 
 class DataCollatorWithPadding:
@@ -258,6 +377,8 @@ def prepare_dp_dataloaders(
     shuffle: Optional[bool] = False,
     is_vlm: Optional[bool] = False,
     prefetch_factor: Optional[int] = 2,
+    length_bucket_sample_lengths: Optional[List[int]] = None,
+    length_bucket_seed: int = 42,
     **dataloader_kwargs,
 ) -> DataLoader:
     """
@@ -278,9 +399,25 @@ def prepare_dp_dataloaders(
     """
     world_size = dist.get_world_size(process_group)
     rank = dist.get_rank(process_group)
-    sampler = DistributedSampler(
-        dataset, num_replicas=world_size, rank=rank, shuffle=shuffle
-    )
+    if length_bucket_sample_lengths is not None:
+        if len(length_bucket_sample_lengths) != len(dataset):
+            raise ValueError(
+                f"length_bucket_sample_lengths has "
+                f"{len(length_bucket_sample_lengths)} entries but dataset "
+                f"has {len(dataset)} samples"
+            )
+        sampler = LengthBucketDistributedSampler(
+            lengths=length_bucket_sample_lengths,
+            num_replicas=world_size,
+            rank=rank,
+            batch_size=batch_size,
+            seed=length_bucket_seed,
+            drop_last=True,
+        )
+    else:
+        sampler = DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank, shuffle=shuffle
+        )
     if is_vlm:
         datacollator_cls = VlmDataCollatorWithPadding
     else:

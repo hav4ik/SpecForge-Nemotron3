@@ -5,7 +5,7 @@ from .preprocessing import (
     preprocess_conversations,
 )
 from .template import ChatTemplate
-from .utils import prepare_dp_dataloaders
+from .utils import LengthBucketDistributedSampler, prepare_dp_dataloaders
 
 __all__ = [
     "build_eagle3_dataset",
@@ -13,5 +13,6 @@ __all__ = [
     "generate_vocab_mapping_file",
     "preprocess_conversations",
     "prepare_dp_dataloaders",
+    "LengthBucketDistributedSampler",
     "ChatTemplate",
 ]
