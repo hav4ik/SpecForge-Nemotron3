@@ -6,6 +6,17 @@ import time
 from argparse import ArgumentParser, Namespace
 from typing import List, Optional, Tuple, Union
 
+# Apply the Mamba SSM fp32 boundary-state patch BEFORE anything else can
+# import mamba_ssm. NemotronH (and any other hybrid Mamba-Transformer
+# verifier loaded via HF custom remote code) will silently downcast the
+# SSM state across chunk boundaries to bf16 otherwise, which causes a
+# ~10% absolute regression on AIME-class math benchmarks. The patch is
+# idempotent and can be disabled via SPECFORGE_DISABLE_MAMBA_FP32_PATCH=1
+# (strongly discouraged). See specforge/_mamba_fp32_patch.py for details.
+from specforge._mamba_fp32_patch import apply as _apply_mamba_fp32_patch
+
+_apply_mamba_fp32_patch()
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
