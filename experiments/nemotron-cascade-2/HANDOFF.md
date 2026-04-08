@@ -76,8 +76,43 @@ Estimate for the new L=32k + bucketing + no-grad-ckpt setup:
 At ~1.7 s/step, ~10000 stage 1 steps -> **~5h**, and ~14500 stage 2
 steps (3 epochs over ~9.6k rows on DP=2) -> **~7h**, totaling
 **~12 h end-to-end**. These numbers should be re-measured once the
-first ~200 steps land and the running average stabilizes; update this
-table with the actual.
+first ~200 steps land and the running average stabilizes.
+
+**Actual measured (2026-04-08 stage 1 launch, first 60 steps)**:
+running average **~3.4 s/step** (high variance: 0.75s to 8.6s).
+Slower than the 1.5-2.0 estimate -- the bucketing pairs lengths
+well across ranks but the long-tail samples still drag the mean
+because rank-pair throughput is bounded by the longer of the two,
+even with pairing-aware sorting. Translates to **~9.5 h for stage 1
+(10000 steps)** and **~14 h for stage 2 (15000 steps no bucketing
+benefit)** = **~24 h end-to-end at L=32k**, still ~40% faster
+than the L=65k baseline would have been.
+
+### Common gotcha: num_proc=32 hangs on small eval datasets
+
+The validation set (`c2_traces_validation.jsonl`, 539 rows) hangs
+forever inside `dataset.map(num_proc=32)` when launched as part of
+the in-train cache build (the train script's auto-build path uses
+`--build-dataset-num-proc 32` which is sized for the 20k-row train
+set). The fix is to **pre-build the eval caches offline** using
+the offline cache builder with a smaller `--num-proc 8`:
+
+```bash
+for L in 16384 32768 65536; do
+    python experiments/nemotron-cascade-2/build_cache_offline.py \
+        --target-model-path nvidia/Nemotron-Cascade-2-30B-A3B \
+        --draft-model-config configs/nemotron-cascade-2-eagle3-sw4k.json \
+        --train-data-path $WORK_DIR/data/c2_traces_validation.jsonl \
+        --chat-template nemotron-h \
+        --max-length $L \
+        --cache-dir $WORK_DIR/cache_l32768 \
+        --num-proc 8 \
+        --trust-remote-code
+done
+```
+
+After that the train script's auto-build path hits the cache and
+skips the slow path entirely.
 
 ### Reverted experimental knobs (and why)
 
