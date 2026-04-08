@@ -30,6 +30,43 @@ verifier sharding, and pushing the trained checkpoint to HF when ready.
    refs. Read in chronological order:
    `git log --reverse --oneline main..HEAD`.
 
+## ⚠️ Mamba SSM state MUST stay in float32 (do not break this)
+
+NemotronH (and any hybrid Mamba-Transformer) requires the Mamba SSM
+state to be **float32**. Downcasting to bf16 causes a ~10% absolute
+regression on AIME-class math benchmarks (Nemotron team's published
+SGLang-vs-vLLM gap was 88.3% → 99.17% on AIME 2025 from this single
+issue alone). The original PROJECT.md flagged this as critical from
+the start.
+
+Upstream `mamba_ssm` 2.3.1 silently downcasts the SSM scan boundary
+state to bf16 inside the Triton kernel. We monkey-patch it to force
+fp32. The patch lives at `specforge/_mamba_fp32_patch.py` and is
+applied at the very top of `scripts/train_eagle3.py` (lines 16-18,
+BEFORE any other module-level imports). It is **bit-equivalent to
+vLLM 0.19's NemotronH default behavior**.
+
+**Do not move, refactor, or delete the patch import.** Do not refactor
+`train_eagle3.py` such that any other module gets imported before the
+patch runs. The precision regression is silent: training will still
+converge but to a worse minimum, you won't see a crash.
+
+To verify the patch is active any time:
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m specforge._mamba_fp32_patch --verify
+# expected: "_state_passing_fwd output dtype is torch.float32 ..."
+```
+
+The patch is flag-gated for emergency disabling via the env var
+`SPECFORGE_DISABLE_MAMBA_FP32_PATCH=1`. **NEVER set this for a
+production training run.** It exists only as a debugging escape hatch.
+
+For the FULL story (audit findings, vLLM equivalence proof, the exact
+call chain, the chunk_size math, etc.), read the "Mamba SSM precision
+-- the full intricacies" section of
+`experiments/nemotron-cascade-2/HANDOFF.md`. Two independent audit
+subagents verified the fix on 2026-04-08; do not regress it.
+
 ## Critical things to know upfront
 
 * **This is a downstream fork.** Upstream is

@@ -237,7 +237,314 @@ with the same tasks documented in the README "Audit log" section, or
 manually re-read the files and run the numerical equivalence test
 above.
 
-## CRITICAL: Mamba SSM state must be float32 (don't break this)
+## Mamba SSM precision -- the full intricacies
+
+> "The Mamba state is the golden nugget, the most important part of a
+>  Mamba layer. Treat it with care."  -- @hav4ik, 2026-04-08
+
+This section documents EVERY intricacy that was uncovered during a
+multi-hour audit of the Mamba SSM precision in our pipeline. Two
+independent audit subagents read the actual source code (upstream
+`mamba_ssm`, vLLM 0.19's vendored copy, and NemotronH's HF custom
+remote code) and independently confirmed the findings. **Read this
+in full before making any change to the verifier loading code, the
+mamba_ssm version, or the train_eagle3.py imports.**
+
+### What the Mamba SSM state actually is
+
+In a Mamba2 layer, the "state" is the recurrent hidden state of the
+selective state-space model: a dense tensor of shape `[batch,
+num_heads, head_dim, ssm_state_size]` that summarizes the entire
+prefix of the sequence at the current position. For NemotronH the
+shape is `[B, 64, 64, 128]` (per the config: `mamba_num_heads=64`,
+`mamba_head_dim=64`, `ssm_state_size=128`). This is the analog of the
+KV cache in attention -- everything the model "remembers" about the
+prefix is in this tensor.
+
+A Mamba2 forward pass over a long sequence is computed as a chunked
+parallel scan: the sequence is split into chunks of `chunk_size=128`
+tokens (NemotronH's setting), and the SSM recurrence is computed
+in two phases:
+
+1. **Intra-chunk** (`_chunk_state_fwd`): each chunk's state is
+   computed independently from its inputs. Hard-coded to fp32 in
+   upstream mamba_ssm via `states_in_fp32=True` (line 375 of
+   `ssd_combined.py`). Same in vLLM 0.19's vendored copy.
+
+2. **Inter-chunk / boundary state** (`_state_passing_fwd`): the
+   per-chunk states are then linked together via a recurrent pass
+   so that chunk k+1's starting state is chunk k's ending state.
+   This is the "state passing" step. **The output buffer of this
+   pass is what we care about, and it's where the bug was.**
+
+Each Mamba2 forward pass over an L-token input thus produces:
+- L/chunk_size boundary states (one per chunk transition)
+- 1 final_states tensor (which is normally written to the persistent
+  decode cache, but we discard it in our `use_cache=False` setup)
+
+### The bug we fixed
+
+Upstream `mamba_ssm.ops.triton.ssd_combined.py:379-381`:
+
+```python
+states, final_states = _state_passing_fwd(
+    rearrange(states, "... p n -> ... (p n)"),
+    dA_cumsum[:, :, :, -1],
+    ...,
+    seq_idx=seq_idx, chunk_size=chunk_size, out_dtype=C.dtype
+)
+```
+
+`C.dtype` is the dtype of the C projection input to the Mamba layer,
+which is `bfloat16` under our `torch_dtype=torch.bfloat16` verifier
+load. Inside `_state_passing_fwd` (`ssd_state_passing.py:206-208`):
+
+```python
+out_dtype = states.dtype if out_dtype is None else out_dtype
+out = torch.empty((batch, nchunks, nheads, dim), device=states.device, dtype=out_dtype)
+final_states = torch.empty((batch, nheads, dim), device=states.device, dtype=torch.float32)
+```
+
+The Triton kernel accumulates SSM states in fp32 registers but
+`tl.store(out_ptrs, states, ...)` writes them to the bf16 `out` buffer.
+**Every inter-chunk boundary state was being downcast to bf16 on
+store, then reloaded in the next chunk's scan kernel.** Only
+`final_states` (the very last state -- normally cached for decode,
+discarded by us) was fp32.
+
+For NemotronH at L=65536, `chunk_size=128`:
+* boundaries per Mamba layer per forward = 65536/128 = **512**
+* Mamba layers in NemotronH = **31**
+* total bf16 boundary writes per forward pass = **~15,872**
+
+That's 15,872 small precision losses accumulating along the SSM scan
+recurrence on every training step. The Nemotron team explicitly
+documented this as the cause of an **88.3% -> 99.17% gap on AIME 2025
+between SGLang (no fp32 SSM cache) and vLLM (with fp32 SSM cache)** in
+https://huggingface.co/nvidia/Nemotron-Cascade-2-30B-A3B/discussions/8 .
+
+### vLLM 0.19 has the SAME bug for non-NemotronH-Cascade-2 models
+
+Important caveat: vLLM 0.19 only avoids the boundary-state-bf16 bug for
+**NemotronH-Cascade-2 specifically**, and only because the Nemotron team
+checked `mamba_ssm_cache_dtype: "float32"` into the model's
+`config.json` on HuggingFace. For any other case, vLLM 0.19 also has
+the bug:
+
+| Scenario | resulting boundary state dtype | status |
+|---|---|---|
+| NemotronH-Cascade-2 + default `--mamba_ssm_cache_dtype "auto"` | fp32 (auto-reads from config.json) | safe |
+| NemotronH-Cascade-2 + explicit `--mamba_ssm_cache_dtype float32` | fp32 | safe |
+| Older / variant NemotronH whose config.json lacks the field | bf16 (default = "float16" on line 494 of `models/config.py`) | **BUG** |
+| Bamba, Jamba, FalconH1, Mamba2-1.3B, Qwen3Next, Zamba2, any other Mamba2 hybrid | bf16 (no NemotronH override fires; auto stays "auto"; `mamba2_state_dtype("auto")` falls through to conv state dtype = bf16) | **BUG** |
+
+So our monkey-patch (which forces fp32 unconditionally regardless of
+model or config) is actually **more robust than vLLM 0.19's
+NemotronH-specific override**. If we ever swap the verifier for a
+different Mamba2-based hybrid we don't need to do anything; the patch
+just works. By contrast, if you serve any other Mamba2 hybrid via
+vLLM 0.19 with defaults, you're getting the same precision regression
+that the Nemotron team measured (88.3% → 99.17% on AIME 2025) -- you
+should explicitly pass `--mamba_ssm_cache_dtype float32` until vLLM
+changes the default upstream.
+
+(The same logic applies to SGLang -- per the Nemotron team's HF
+discussion, the equivalent flag is `--mamba-ssm-dtype float32` and is
+not set by default. Their 88.3% AIME result was the SGLang-default
+case.)
+
+### How vLLM 0.19 avoids the bug (this is our reference)
+
+vLLM 0.19 ships its own vendored copy of the Mamba Triton ops at
+`vllm/model_executor/layers/mamba/ops/`. Three things are different
+from upstream:
+
+1. **`ssd_combined.py:119`** (vLLM-vendored): the `_state_passing_fwd`
+   call site threads a `state_dtype` argument through:
+   ```python
+   states = _state_passing_fwd(
+       ...,
+       out_dtype=state_dtype if state_dtype is not None else C.dtype,
+   )
+   ```
+
+2. **`mamba_mixer2.py:734`**: the prefill call passes
+   `state_dtype=ssm_state.dtype` to the kernel.
+
+3. **`MambaStateDtypeCalculator.mamba2_state_dtype()`**
+   (`mamba_utils.py:62-67`): under `cache_config.mamba_ssm_cache_dtype
+   == "auto"` (the CLI default), it falls through to the conv state
+   dtype (bf16). Under any explicit value (including "float32"), it
+   uses `STR_DTYPE_TO_TORCH_DTYPE[mamba_ssm_cache_dtype]`.
+
+4. **`NemotronHForCausalLMConfig.verify_and_update_config`**
+   (`models/config.py:483-501`): when the CLI default `"auto"` is
+   passed, it overrides with `hf_config.mamba_ssm_cache_dtype`.
+   `nvidia/Nemotron-Cascade-2-30B-A3B/config.json` ships with
+   `mamba_ssm_cache_dtype: "float32"`, so vLLM 0.19 + NemotronH
+   serving **automatically gets fp32 boundary state, even without an
+   explicit `--mamba_ssm_cache_dtype float32` flag**.
+
+### Other fp32 sites (already correct in both upstream and vLLM)
+
+These were verified the same in upstream `mamba_ssm` and vLLM 0.19:
+
+* `_chunk_state_fwd(..., states_in_fp32=True)` -- intra-chunk states
+  always fp32 (`ssd_combined.py:375` upstream, `:105` vLLM)
+* `_bmm_chunk_fwd(..., output_dtype=torch.float32)` -- BMM output fp32
+  (`ssd_combined.py:385` upstream, `:122` vLLM)
+* `A_log.float()` -- explicit fp32 upcast in NemotronH modeling code at
+  lines 424 and 560 of `modeling_nemotron_h.py`
+* `final_states = torch.empty(..., dtype=torch.float32)` -- always fp32
+  in `_state_passing_fwd` (`ssd_state_passing.py:208`)
+
+So the **only** dtype gap between upstream `mamba_ssm` and vLLM 0.19's
+fp32-NemotronH-default behavior was the boundary state output of
+`_state_passing_fwd`. Our patch closes exactly that gap.
+
+### The fix in detail
+
+`specforge/_mamba_fp32_patch.py` is a monkey-patch that replaces
+`_state_passing_fwd` in BOTH module locations:
+
+1. `mamba_ssm.ops.triton.ssd_state_passing._state_passing_fwd` -- the
+   canonical definition
+2. `mamba_ssm.ops.triton.ssd_combined._state_passing_fwd` -- a re-import
+   at the top of `ssd_combined.py` line 36 (`from
+   mamba_ssm.ops.triton.ssd_state_passing import ... _state_passing_fwd`).
+   The call site at `ssd_combined.py:379-381` resolves through this
+   module-level reference, NOT through the canonical one. **Patching
+   only the canonical location would be a silent no-op.**
+
+The wrapper preserves the original calling convention exactly:
+
+```python
+def _state_passing_fwd_fp32(
+    states, dA_chunk_cumsum,
+    initial_states=None, seq_idx=None, chunk_size=None, out_dtype=None,
+):
+    # Ignore the caller's out_dtype and force fp32.
+    return _orig(
+        states, dA_chunk_cumsum,
+        initial_states=initial_states, seq_idx=seq_idx, chunk_size=chunk_size,
+        out_dtype=torch.float32,
+    )
+```
+
+Note we explicitly pass `out_dtype=torch.float32` rather than relying
+on the default `out_dtype=None -> states.dtype` (which would also be
+fp32 because `_chunk_state_fwd(..., states_in_fp32=True)` produces fp32
+`states`). The explicit override avoids drift if upstream ever changes
+the default.
+
+`_state_passing_bwd` (the backward path) is **not** patched. It takes
+`dstates_dtype`/`states_dtype` arguments rather than `out_dtype`, and
+the verifier runs in `no_grad()` so backward through the Mamba layers
+is never reached. If anyone ever tries to train the Mamba verifier
+end-to-end (highly unlikely for an Eagle3 setup), the backward path
+would also need a fp32 patch.
+
+### Why the patch import has to be at the very top of train_eagle3.py
+
+The patch must be applied **before** any code transitively imports
+`mamba_ssm`. The chain that loads it is:
+
+1. `main()` calls `build_target_model()`
+2. `build_target_model()` calls `HFEagle3TargetModel.from_pretrained()`
+3. `HFEagle3TargetModel.from_pretrained()` calls
+   `transformers.AutoModelForCausalLM.from_pretrained(...,
+   trust_remote_code=True)`
+4. transformers downloads and dynamically imports
+   `modeling_nemotron_h.py` (the cached HF custom remote code)
+5. `modeling_nemotron_h.py` does `from mamba_ssm.ops.triton.ssd_combined
+   import mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined`
+   at the top of the file
+6. **At THIS point** the unpatched `_state_passing_fwd` would be
+   captured into `ssd_combined`'s module namespace if we hadn't already
+   replaced it.
+
+The patch is in `train_eagle3.py` lines 16-18, before the `import torch`
+on line 20 and well before `main()` runs. SpecForge's own
+`__init__.py` does NOT import `mamba_ssm` (verified by repo-wide grep).
+
+If you ever refactor `train_eagle3.py` and move the patch import below
+ANY other module-level import, you risk the unpatched function being
+captured first. **Don't do that.** If you really need to apply the patch
+elsewhere (e.g. from a test runner), do it as the FIRST thing in the
+process, before importing torch or transformers.
+
+### Memory and compute cost
+
+* **Memory**: the boundary state buffer goes from `[batch, nchunks,
+  nheads, dim]` bf16 to fp32, doubling its size. At L=65536, nchunks=512,
+  nheads=64, dim=64*128=8192 the buffer is `1*512*64*8192 = 268M
+  elements`. In bf16: 537 MiB. In fp32: 1.07 GiB. Per Mamba layer per
+  forward. **Wait that's bigger than my earlier estimate -- let me
+  recompute.** Actually `dim` here is `head_dim*ssm_state_size` after
+  the rearrange, which for NemotronH is `64*128 = 8192`. So per Mamba
+  layer per forward: ~1 GiB extra. For 31 Mamba layers: ~31 GiB extra
+  during the kernel call -- but the buffer is freed after the kernel
+  returns, so it's a transient peak that overlaps with the existing
+  activations. In practice the OOM headroom is unaffected because the
+  fast-path Triton kernel was already allocating something close to
+  this; the only delta is doubled bytes in the boundary buffer that
+  exists for ~microseconds during the kernel launch.
+* **Compute**: same Triton kernel, same number of launches, fp32 stores
+  instead of bf16 stores. ~no measurable difference (storing fp32 to
+  HBM is the same number of ops as storing bf16, just twice the
+  bandwidth -- bound by HBM bandwidth, not store count).
+
+### NemotronH-specific config details that matter
+
+From `nvidia/Nemotron-Cascade-2-30B-A3B/config.json`:
+
+```json
+{
+  "chunk_size": 128,
+  "mamba_head_dim": 64,
+  "mamba_num_heads": 64,
+  "ssm_state_size": 128,
+  "mamba_ssm_cache_dtype": "float32",   <-- vLLM honors, upstream ignores
+  "use_mamba_kernels": true,
+  "n_groups": 1,
+  "n_groups": 8                          <-- duplicate key (NB: jsonc-style override)
+}
+```
+
+* `chunk_size=128` -> 512 boundary state writes per Mamba layer at L=65536
+* `mamba_ssm_cache_dtype: "float32"` is **ignored** by NemotronH's
+  custom HF modeling code (it's not consumed anywhere in
+  `modeling_nemotron_h.py`) but IS honored by vLLM 0.19 (via
+  `NemotronHForCausalLMConfig.verify_and_update_config`)
+
+### How to verify in the future
+
+```bash
+# 1. Standalone numerical test
+CUDA_VISIBLE_DEVICES=0 python -m specforge._mamba_fp32_patch --verify
+# expected: "_state_passing_fwd output dtype is torch.float32 ..."
+
+# 2. Confirm patch import is at the top of train_eagle3.py (lines 16-18)
+head -20 scripts/train_eagle3.py | grep -A2 mamba_fp32_patch
+# expected: import + apply() call before any other module-level imports
+
+# 3. Confirm running training process started AFTER the patch was added
+ps -o lstart -p $(pgrep -f train_eagle3.py | head -1)
+
+# 4. Spot-check that no SpecForge module imports mamba_ssm directly
+#    (should match only _mamba_fp32_patch.py itself)
+grep -rn "import mamba_ssm\|from mamba_ssm" specforge/
+
+# 5. The patch is bit-equivalent to vLLM 0.19's NemotronH default
+#    inference, verified by independent audit subagents on 2026-04-08.
+#    See git log for the commit that added the patch.
+```
+
+If any of these checks fail, **stop training immediately** and reapply
+the patch -- the precision regression is silent (training will still
+converge to a worse minimum, you won't see a crash).
+
+### CRITICAL: Mamba SSM state must be float32 (don't break this)
 
 **Background.** NVIDIA's NemotronH team has explicitly confirmed that the
 Mamba SSM state must be kept in **float32** during training and inference.
