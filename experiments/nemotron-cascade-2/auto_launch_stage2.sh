@@ -126,9 +126,38 @@ while true; do
 
         # Optionally restart the auto-push watcher to track stage 2.
         if [[ "$AUTO_RESTART_WATCHER" == "1" ]]; then
+            echo "[auto-stage2] $(date -Iseconds) draining stage 1 auto-push watcher (race mitigation)"
+            # RACE FIX: the stage 1 watcher may be mid-upload of the
+            # tagged-branch push for the final checkpoint when we get
+            # here, OR it may have just finished the tagged push but
+            # not yet started the main-update pass. If we kill it now
+            # the main branch will be left at the previous checkpoint
+            # (step N-2000 instead of N=final). To avoid this:
+            #   1. Wait POLL_INTERVAL + 60s so the watcher's NEXT scan
+            #      iteration has time to (a) finish any in-flight
+            #      tagged push and (b) run its main-update pass on the
+            #      newly-complete final checkpoint.
+            #   2. Then kill it.
+            #   3. Defensively, force a final main push of the stage 1
+            #      final checkpoint so even if the wait wasn't enough
+            #      we still get main pointing at the right place.
+            sleep $((POLL_INTERVAL + 60))
             echo "[auto-stage2] $(date -Iseconds) killing stage 1 auto-push watcher"
             pkill -f "auto_push_checkpoints.sh" || true
             sleep 2
+
+            echo "[auto-stage2] $(date -Iseconds) defensive: forcing main push of stage 1 final checkpoint"
+            python "$SCRIPT_DIR/_push_checkpoint.py" \
+                --ckpt-dir "$STAGE1_FINAL_DIR" \
+                --repo "$PUSH_REPO" \
+                --branch main \
+                --commit-message "stage1 final checkpoint from $(basename $STAGE1_FINAL_DIR)" \
+                || echo "[auto-stage2] $(date -Iseconds) WARN: defensive main push failed; main may be at step N-1"
+            # Update the stage 1 latest-main state file so a re-run of
+            # the stage 1 watcher (if it's ever restarted) won't try to
+            # re-push.
+            echo "$(basename $STAGE1_FINAL_DIR)" > "$WORK_DIR/.pushed_checkpoints_stage1.latest_main"
+
             echo "[auto-stage2] $(date -Iseconds) starting stage 2 auto-push watcher"
             STAGE=stage2 REPO="$PUSH_REPO" \
                 nohup bash "$SCRIPT_DIR/auto_push_checkpoints.sh" \
