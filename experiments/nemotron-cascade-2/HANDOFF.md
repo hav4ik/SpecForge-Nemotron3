@@ -177,11 +177,23 @@ python experiments/nemotron-cascade-2/build_union_vocab_mapping.py \
 ```
 
 The first build of this iteration showed:
-* stage 1 alone: 81,439 unique loss-masked tokens
-* stage 1 + stage 2 union: 83,209 (stage 2 contributed 1,770 NEW tokens
-  not present in stage 1's loss-masked positions -- mostly latex /
-  reasoning markers)
-* top-32000 union covers 99.77% of all tokens by frequency
+* stage 1 alone: 81,439 unique loss-masked tokens, 132.9M total
+* stage 2 alone: 36,510 unique loss-masked tokens, 158.8M total
+  (much narrower distribution: stage 2 has ~half the unique tokens
+  but ~20% more total tokens because reasoning traces are long)
+* union: 83,209 unique tokens, 291.7M total (stage 2 contributed
+  1,770 NEW tokens not present in stage 1's loss-masked positions
+  -- mostly latex / reasoning markers)
+* **Per-stage coverage with union top-32k:**
+  * stage 1: 99.5328% of tokens by frequency (~621k lost = ~0.47%)
+  * stage 2: **99.9621%** of tokens by frequency (~60k lost = ~0.04%)
+  * Stage 2 has *better* coverage than stage 1 even though the
+    union top-32k was built jointly -- because stage 2's
+    distribution is narrower / more concentrated. Reasoning traces
+    use a much tighter vocabulary than the broad SFT pool's web /
+    code / multilingual long tail.
+  * Unique tokens IN draft vocab: stage 1 = 31978/81439 (39.27%);
+    stage 2 = 26017/36510 (71.26%).
 
 Both stage launchers default `VOCAB_MAPPING_PATH` to
 `$WORK_DIR/data/union_vocab_mapping_l32k.pt`. If you change the

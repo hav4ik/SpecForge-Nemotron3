@@ -195,19 +195,26 @@ def main():
         num_proc=args.num_proc,
     )
 
-    token_counter: Counter = Counter()
-    _accumulate_token_counts(stage1_ds, token_counter, label="stage1")
-    s1_unique = len(token_counter)
-    s1_total = sum(token_counter.values())
-    print(f"[union-vocab] after stage1: {s1_unique} unique tokens, {s1_total} total")
-
-    _accumulate_token_counts(stage2_ds, token_counter, label="stage2")
-    sU_unique = len(token_counter)
-    sU_total = sum(token_counter.values())
+    s1_counter: Counter = Counter()
+    s2_counter: Counter = Counter()
+    _accumulate_token_counts(stage1_ds, s1_counter, label="stage1")
+    _accumulate_token_counts(stage2_ds, s2_counter, label="stage2")
     print(
-        f"[union-vocab] after stage1+stage2 union: "
-        f"{sU_unique} unique tokens, {sU_total} total "
-        f"(stage2 added {sU_unique - s1_unique} new tokens)"
+        f"[union-vocab] stage1: {len(s1_counter)} unique tokens, "
+        f"{sum(s1_counter.values())} total"
+    )
+    print(
+        f"[union-vocab] stage2: {len(s2_counter)} unique tokens, "
+        f"{sum(s2_counter.values())} total"
+    )
+    token_counter: Counter = Counter()
+    token_counter.update(s1_counter)
+    token_counter.update(s2_counter)
+    print(
+        f"[union-vocab] union: {len(token_counter)} unique tokens, "
+        f"{sum(token_counter.values())} total "
+        f"(stage2 contributed {len(token_counter) - len(s1_counter)} "
+        f"new tokens not in stage1)"
     )
 
     d2t, t2d = process_token_dict_to_mappings(
@@ -215,6 +222,46 @@ def main():
         draft_model_config.draft_vocab_size,
         draft_model_config.vocab_size,
     )
+
+    # Per-stage coverage report. The union mapping is built from the
+    # combined token frequencies, so the top-K is union-optimal -- but
+    # the per-stage coverage may differ. Stage 2 (narrower distribution
+    # like reasoning traces) typically gets better coverage than the
+    # broader stage 1 SFT pool. This is the "<1% of positions are out
+    # of vocab" stat that lives in HANDOFF.md and is the load-bearing
+    # claim that the chosen draft_vocab_size is actually big enough.
+    in_vocab_set = set(d2t.tolist())  # in target-vocab id space
+    # process_token_dict_to_mappings stored d2t as offsets, not target ids;
+    # reconstruct the target id set from t2d which is direct.
+    in_vocab_set = set(int(i) for i, v in enumerate(t2d.tolist()) if v)
+
+    def _coverage(counter):
+        total = sum(counter.values())
+        in_covered = sum(c for t, c in counter.items() if int(t) in in_vocab_set)
+        n_unique = len(counter)
+        n_unique_in = sum(1 for t in counter if int(t) in in_vocab_set)
+        return {
+            "total": total,
+            "covered": in_covered,
+            "lost": total - in_covered,
+            "unique": n_unique,
+            "unique_in": n_unique_in,
+            "pct_freq": (100.0 * in_covered / total) if total > 0 else 0.0,
+            "pct_unique": (100.0 * n_unique_in / n_unique) if n_unique > 0 else 0.0,
+        }
+
+    s1_cov = _coverage(s1_counter)
+    s2_cov = _coverage(s2_counter)
+    print()
+    print("[union-vocab] === per-stage coverage with union top-K ===")
+    for label, c in [("stage1", s1_cov), ("stage2", s2_cov)]:
+        print(
+            f"  {label}: total={c['total']:,} unique={c['unique']:,}  "
+            f"covered={c['covered']:,} ({c['pct_freq']:.4f}%)  "
+            f"lost={c['lost']:,} ({100.0 - c['pct_freq']:.4f}%)  "
+            f"unique-in-vocab={c['unique_in']:,}/{c['unique']:,} "
+            f"({c['pct_unique']:.2f}%)"
+        )
 
     out_dir = os.path.dirname(os.path.abspath(args.output_path))
     if out_dir:
