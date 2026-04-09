@@ -75,7 +75,12 @@ EVAL_DATA=${EVAL_DATA:-$WORK_DIR/data/c2_traces_validation.jsonl}
 TARGET_MODEL=${TARGET_MODEL:-nvidia/Nemotron-Cascade-2-30B-A3B}
 NUM_GPUS=${NUM_GPUS:-2}
 NUM_EPOCHS=${NUM_EPOCHS:-3}
-LEARNING_RATE=${LEARNING_RATE:-3e-5}
+# LEARNING_RATE was 3e-5 in the first V2 launch -- combined with bucketing
+# (which creates large per-batch gradient variance from CoT-vs-trace
+# clustering), it knocked the warm-started weights out of the V1 minimum
+# and the model began oscillating + drifting downward. Lowered to 1e-5
+# for the second V2 launch. Same gentleness logic applies to warmup_ratio.
+LEARNING_RATE=${LEARNING_RATE:-1e-5}
 WARMUP_RATIO=${WARMUP_RATIO:-0.01}
 TTT_LENGTH=${TTT_LENGTH:-7}
 MAX_LENGTH=${MAX_LENGTH:-32768}
@@ -136,7 +141,6 @@ python -m torch.distributed.run \
     --eval-lengths 65536 \
     --eval-interval 1000 \
     --vocab-mapping-path "$VOCAB_MAPPING_PATH" \
-    --with-data-bucketing \
     --chat-template nemotron-h \
     --cache-dir "$CACHE_DIR" \
     --output-dir "$WORK_DIR/checkpoints/nemotron-cascade-2-eagle3-v2" \
@@ -159,5 +163,5 @@ python -m torch.distributed.run \
     --model-card-template "$SCRIPT_DIR/MODEL_CARD_TEMPLATE_sw4k.md" \
     --report-to wandb \
     --wandb-project nemotron-cascade-2-eagle3 \
-    --wandb-name "v2-L${MAX_LENGTH}-ttt${TTT_LENGTH}-sw4k-bucketed-cot" \
+    --wandb-name "v2-L${MAX_LENGTH}-ttt${TTT_LENGTH}-sw4k-cot-lr${LEARNING_RATE}" \
     "$@"
