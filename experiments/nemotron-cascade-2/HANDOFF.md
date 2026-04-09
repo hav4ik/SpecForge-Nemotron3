@@ -5,12 +5,132 @@ the checkpoints live. If you're a new agent picking this up, **read this
 first**, then `README.md` for the engineering rationale, then `git log
 --oneline main..HEAD` for the patch tour.
 
-If you're a future-me reading this without the conversation history: this
-folder is the current state of a multi-day debugging effort to get a long-
-context Eagle3 draft head trained on a hybrid Mamba-Transformer verifier.
-**The training engineering is done; what remains is launching the
-2-stage training described below, monitoring the run, and pushing the
-trained checkpoint to HF when it's ready.**
+## STOP — read this section before ANYTHING else (2026-04-09 final dump)
+
+**Training engineering is DONE. Two full iterations have been run.
+V2 may still be in flight when you pick this up.**
+
+### What exists right now
+
+| Artifact | Location | Status |
+|---|---|---|
+| **V1 baseline head** (ttt=6, L=32k, 2-stage, no CoT) | HF `chankhavu/c2.eagle3-test` (main = stage2-step-12000) | ✅ **DONE**, all checkpoints preserved on per-step branches |
+| **V2 head** (ttt=7, L=32k, single-stage warm-start, +CoT) | HF `chankhavu/c2.eagle3-test-v2` (auto-created on first V2 ckpt push) | 🟡 **MAY BE IN FLIGHT** — check `ps -ef \| grep train_eagle3` |
+| All code + configs + scripts | This branch (`nemotron-cascade-2-experiments`) on `github.com/hav4ik/SpecForge-Nemotron3` | ✅ Up to date |
+| Wandb runs | `wandb.ai/hav4ik/nemotron-cascade-2-eagle3` | ✅ See run ID table below |
+| Training data + caches | `$WORK_DIR/data/` and `$WORK_DIR/cache_l32768/` (local disk, NOT on HF) | ⚠️ Lost on instance teardown; rebuild via prep scripts |
+| V1 union vocab mapping | `$WORK_DIR/data/union_vocab_mapping_l32k.pt` | ⚠️ Lost on teardown; rebuild via `build_union_vocab_mapping.py` |
+| Auto-push watcher | `auto_push_checkpoints.sh` with `STAGE=v2 REPO=chankhavu/c2.eagle3-test-v2` | 🟡 May be running; `pkill -f auto_push` to stop |
+
+### Wandb run ID table (complete history)
+
+| Run ID | Name | State | What it was |
+|---|---|---|---|
+| `0fkrs68u` | `stage1-L32768-ttt6-sw4k-bucketed` | finished | V1 stage 1 (SFT bootstrap, 10k steps) |
+| `yz5vd3qw` | `stage2-L32768-ttt6-sw4k` | killed | V1 stage 2 (on-policy traces, killed at step 12000 by user) |
+| `wxldpgrn` | `v2-L32768-ttt7-sw4k-bucketed-cot` | crashed | **FAILED** V2 first attempt (bucketing + warm-start = oscillation + regression) |
+| `aw93g0lm` | `v2-L32768-ttt7-sw4k-cot-lr1e-5` | running (or finished) | **CURRENT** V2 relaunch (no bucketing, lr=1e-5, stable) |
+| (many older) | `mixed-*`, `sw4k-*` | crashed | Early engineering iterations, ignore |
+
+### If V2 training is still running when you arrive
+
+```bash
+# Check
+ps -ef | grep train_eagle3 | grep -v grep
+tail -c 500 /workspace/eagle3_training/logs/train_v2.log | tr '\r' '\n' | tail -3
+
+# It should be writing checkpoints to:
+ls $WORK_DIR/checkpoints/nemotron-cascade-2-eagle3-v2/
+
+# The watcher auto-pushes each checkpoint to chankhavu/c2.eagle3-test-v2
+# If the watcher died, restart:
+export WORK_DIR=$(pwd)/eagle3-work && export HF_HOME=/workspace/models
+STAGE=v2 REPO=chankhavu/c2.eagle3-test-v2 \
+    nohup bash experiments/nemotron-cascade-2/auto_push_checkpoints.sh \
+    > $WORK_DIR/logs/auto_push_v2.log 2>&1 & disown
+```
+
+### If V2 training died and you need to resume
+
+```bash
+export WORK_DIR=$(pwd)/eagle3-work && export HF_HOME=/workspace/models
+# Find the latest V2 checkpoint:
+ls $WORK_DIR/checkpoints/nemotron-cascade-2-eagle3-v2/
+# If checkpoints exist, resume:
+bash experiments/nemotron-cascade-2/run_train_v2.sh --resume \
+    > /workspace/eagle3_training/logs/train_v2.log 2>&1 & disown
+# If NO V2 checkpoints exist, restart from V1 final:
+CKPT_DIR=$WORK_DIR/checkpoints/nemotron-cascade-2-eagle3-stage2/epoch_2_step_12000 \
+    bash experiments/nemotron-cascade-2/run_train_v2.sh \
+    > /workspace/eagle3_training/logs/train_v2.log 2>&1 & disown
+```
+
+### If you're on a FRESH INSTANCE (nothing local, only the git repo + HF)
+
+See the "First 5 minutes on a new instance" section below. The boot
+sequence is comprehensive but takes ~20 min of prep before training
+can start.
+
+### Key numbers from V1 (the baseline to beat)
+
+V1 stage 2 final eval at L=65536 (on c2_traces_validation, 539 rows):
+```
+acc_0=0.819  acc_1=0.750  acc_2=0.713  acc_3=0.688  acc_4=0.668  acc_5=0.651
+```
+V1 was ttt=6 (6 positions). V2 adds position 6 and targets:
+```
+acc_0≥0.82  acc_1≥0.75  acc_2≥0.72  acc_3≥0.70  acc_4≥0.68  acc_5≥0.66  acc_6≥0.65
+```
+
+### Hard-won lessons (do NOT repeat these mistakes)
+
+1. **Bucketing + warm-start = regression.** Length-bucketed sampling
+   on warm-started weights caused V2's first attempt to oscillate and
+   drift below V1. Root cause: bucketed batches cluster CoT (long)
+   samples together, creating high-variance gradients that kick
+   converged weights out of their basin. Fix: disable bucketing for
+   warm-started runs. Bucketing is fine for from-scratch training
+   (V1 stage 1 used it successfully).
+
+2. **Vocab mapping must be UNION across all stages/versions.** The
+   d2t/t2d buffers in the lm_head must be identical between any
+   checkpoint you're loading from (`--ckpt-dir`) and the current
+   training run. V2 reuses V1's `union_vocab_mapping_l32k.pt`
+   unchanged because the CoT data adds only 0.04% out-of-vocab
+   tokens (negligible). If you add substantially new data that
+   shifts the token distribution, rebuild the union mapping and
+   accept you'll lose warm-start benefit on the lm_head.
+
+3. **`print_on_rank0` is silently broken.** It uses `logger.info`
+   but no `logging.basicConfig()` is ever called, so all INFO
+   messages are dropped. Eval per-position metrics are NEVER in
+   stdout/the local log file. Pull metrics from wandb instead.
+
+4. **`dataset.map(num_proc=32)` hangs on small datasets.** The
+   539-row eval set deadlocks at num_proc=32. Pre-build eval caches
+   offline with `--num-proc 8` using `build_cache_offline.py`.
+
+5. **HF_HOME must point at the verifier cache.** On the previous
+   instance it was `/workspace/models`. If HF_HOME points elsewhere,
+   HF will try to redownload the 63 GB verifier and probably fail
+   on disk space. The auto-push watcher also needs the HF auth token
+   at `$HF_HOME/token` — copy it from wherever `hf auth login`
+   wrote it.
+
+6. **ttt=8 doesn't fit at L=32k without grad-ckpt.** V2 at ttt=7
+   uses 73-95 GB per rank. ttt=8 would need ~100+ GB → OOM on 96 GB
+   GPUs unless `--draft-mlp-grad-checkpoint` is re-enabled (costs
+   ~25% per-step throughput).
+
+7. **The orchestrator has a race condition** between killing the
+   stage 1 watcher and the stage 1 watcher's final main-push. The
+   fix in `auto_launch_stage2.sh` adds a drain wait + defensive
+   final push. Was fixed mid-V1 (commit `7406a36`).
+
+8. **Multi-length eval (16k/32k/64k) is not needed.** V1's data
+   showed <0.005 gap across all 3 lengths. Sliding-window draft
+   generalizes cleanly to longer contexts. V2 uses single L=65536
+   eval only.
 
 ## Current iteration plan (2026-04-08)
 
@@ -88,7 +208,47 @@ even with pairing-aware sorting. Translates to **~9.5 h for stage 1
 benefit)** = **~24 h end-to-end at L=32k**, still ~40% faster
 than the L=65k baseline would have been.
 
-### Active session state (2026-04-08, mid stage 1)
+### Active session state (2026-04-09, V2 relaunch in flight)
+
+**V1 training is DONE.** V2 (ttt=7, CoT included, warm-start from V1
+final) is currently running.
+
+* **V2 training process**: run name `v2-L32768-ttt7-sw4k-cot-lr1e-5`,
+  wandb id `aw93g0lm` at `wandb.ai/hav4ik/nemotron-cascade-2-eagle3`.
+  Step ~1462 / 5283 in epoch 0 of 3 as of last check. Loss 0.81,
+  mean acc 0.78 (across all 7 TTT positions). Per-step time ~3.0-3.5s.
+  First V2 checkpoint at step 2000 (~30 min from this commit).
+  **The V2 run has NOT yet saved a checkpoint.** If the instance is
+  killed before step 2000, V2 is lost and must be relaunched from V1's
+  final checkpoint.
+
+* **V1 final state**: all 5 stage 1 checkpoints + 6 stage 2 checkpoints
+  on disk + on HF `chankhavu/c2.eagle3-test`. V1's best per-position
+  eval (L=65k, step 8000 of stage 2):
+  ```
+  acc_0=0.819  acc_1=0.750  acc_2=0.713  acc_3=0.688  acc_4=0.668  acc_5=0.651
+  ```
+  V2's per-position train acc (step 620, 7 positions) was:
+  ```
+  acc_0=0.821  acc_1=0.764  acc_2=0.735  acc_3=0.715  acc_4=0.698  acc_5=0.680  acc_6=0.665
+  ```
+  So V2 is already matching or slightly above V1 with the new ttt=7
+  position 6 also contributing usefully.
+
+* **CRITICAL LESSON: bucketing + warm-start = BAD.** The first V2
+  launch attempt (wandb run `wxldpgrn`, "v2-L32768-ttt7-sw4k-bucketed-cot")
+  used `--with-data-bucketing` at lr=3e-5 and REGRESSED below V1:
+  acc_0 drifted from 0.867 → 0.777 in ~500 steps. Root cause: bucketing
+  clusters CoT samples (long) together, creating high-variance per-batch
+  gradients that knocked the warm-started weights out of the V1 basin.
+  Fixed by (a) removing `--with-data-bucketing` and (b) lowering LR to
+  1e-5. The fixed V2 (run `aw93g0lm`) is stable at ~0.82 acc_0 through
+  step 620+. **Do NOT re-enable bucketing on warm-started runs.**
+
+### Active session state (2026-04-08, mid stage 1) [HISTORICAL]
+
+Below is the state from the FIRST agent session. Kept for reference
+but largely superseded by the V2 state above.
 
 * **Wandb run**: `stage1-L32768-ttt6-sw4k-bucketed`, id `0fkrs68u` at
   `wandb.ai/hav4ik/nemotron-cascade-2-eagle3/runs/0fkrs68u`
