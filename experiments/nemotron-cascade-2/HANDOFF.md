@@ -123,10 +123,21 @@ than the L=65k baseline would have been.
   finishes or stage 2 will launch). The orchestrator MUST be
   invoked with `HF_HOME=/workspace/models` exported, otherwise the
   stage 2 launch will try to redownload the verifier.
-* **Published HF model**: https://huggingface.co/chankhavu/c2.eagle3-test
-  -- mid-training test artifact, NOT a final shippable head. The repo
-  has the latest checkpoint on `main` and per-step tagged branches
-  (`stage1-step-2000`, `stage1-step-4000`, ...).
+* **Published HF models**:
+  * **V1**: https://huggingface.co/chankhavu/c2.eagle3-test
+    -- the V1 baseline (2-stage, ttt=6, no CoT). `main` is at
+    `stage2-step-12000` (the V1 final). Per-step history preserved on
+    branches `stage1-step-2000` ... `stage1-step-10000` and
+    `stage2-step-2000` ... `stage2-step-12000`.
+  * **V2**: https://huggingface.co/chankhavu/c2.eagle3-test-v2
+    -- the V2 follow-up iteration (single-stage warm-start from V1
+    final, ttt=7, CoT data included, --with-data-bucketing).
+    Auto-created on the first V2 checkpoint push.
+
+  V1 and V2 are intentionally in SEPARATE repos so V2's main doesn't
+  overwrite the V1 baseline. The V2 watcher (auto_push_checkpoints.sh
+  with STAGE=v2 REPO=chankhavu/c2.eagle3-test-v2) is the only thing
+  pushing to the v2 repo.
 * **Verifier weights are at `/workspace/models/`** (NOT `/workspace/.hf_home/`).
   All launchers should set `export HF_HOME=/workspace/models` before
   running, otherwise HF will try to re-download the 63 GB verifier into
